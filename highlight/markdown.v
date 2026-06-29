@@ -1,6 +1,6 @@
 module highlight
 
-import x.markdown
+import markdown
 import regex.pcre
 
 const allowed_tags = [

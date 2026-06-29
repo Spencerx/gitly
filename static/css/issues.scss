@@ -133,6 +133,35 @@
 		color: #57606a;
 		margin: 0 0 12px;
 	}
+
+	table {
+		display: block;
+		width: max-content;
+		max-width: 100%;
+		overflow: auto;
+		border-collapse: collapse;
+		border-spacing: 0;
+		margin: 0 0 12px;
+	}
+
+	tr {
+		background-color: #ffffff;
+		border-top: 1px solid #d8dee4;
+	}
+
+	tr:nth-child(2n) {
+		background-color: #f6f8fa;
+	}
+
+	th,
+	td {
+		padding: 6px 13px;
+		border: 1px solid #d0d7de;
+	}
+
+	th {
+		font-weight: 600;
+	}
 }
 
 .comment-form {
