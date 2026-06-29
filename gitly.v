@@ -438,6 +438,8 @@ fn (mut app App) migrate_tables() ! {
 	app.add_missing_column('Repo', 'disable_wiki', db_bool_column_type())!
 	app.add_missing_column('Repo', 'is_pinned', db_bool_column_type())!
 	app.add_missing_column('Repo', 'created_at', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('PullRequest', 'merged_at', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('PullRequest', 'merge_commit_hash', "TEXT NOT NULL DEFAULT ''")!
 	app.backfill_repo_created_at()!
 
 	app.db.exec('create index if not exists idx_commit_repo_created on ${sql_table('Commit')} (repo_id, created_at desc)')!
