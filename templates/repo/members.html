@@ -1,0 +1,71 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include '../layout/head.html'
+	</head>
+	<body>
+		@include '../layout/header.html'
+		<div class="content">
+			@include '../layout/repo_menu.html'
+			<div class="settings-breadcrumb"><a href="/@repo.user_name/@repo.name/settings">Settings</a> / Members</div>
+			<h1 class="settings-title">Project members</h1>
+			@if ctx.form_error != ''
+				<div class="form-error">@ctx.form_error</div>
+			@end
+			<section class="settings-section">
+				<h2 class="settings-section__title">Invite a member</h2>
+				<p class="settings-section__desc">Reporters can clone and read. Developers can also push to unprotected branches. Maintainers can manage the project.</p>
+				<form class="settings-form governance-form" method="post" action="/@repo.user_name/@repo.name/settings/members">
+					<input type="text" name="member_username" placeholder="Username" autocomplete="off" required>
+					<select name="role" required>
+						<option value="reporter">Reporter</option>
+						<option value="developer">Developer</option>
+						<option value="maintainer">Maintainer</option>
+					</select>
+					<button class="settings-form__submit" type="submit">Add member</button>
+				</form>
+			</section>
+			<section class="settings-section">
+				<h2 class="settings-section__title">Direct members</h2>
+				@if members.len == 0
+					<p class="settings-empty">No direct project members yet. Namespace members may still have inherited access.</p>
+				@else
+					<div class="governance-list">
+						@for item in members
+							<div class="governance-row">
+								<div class="governance-row__identity">
+									<img src="@{app.prepare_user_avatar_url(item.user.avatar)}" alt="">
+									<div><a href="/@item.user.username">@item.user.username</a><small>Direct project access</small></div>
+								</div>
+								<form class="settings-form governance-row__actions" method="post" action="/@repo.user_name/@repo.name/settings/members/@item.member.id">
+									<select name="role">
+										@if item.member.role == 'reporter'
+											<option value="reporter" selected>Reporter</option>
+										@else
+											<option value="reporter">Reporter</option>
+										@end
+										@if item.member.role == 'developer'
+											<option value="developer" selected>Developer</option>
+										@else
+											<option value="developer">Developer</option>
+										@end
+										@if item.member.role == 'maintainer'
+											<option value="maintainer" selected>Maintainer</option>
+										@else
+											<option value="maintainer">Maintainer</option>
+										@end
+									</select>
+									<button type="submit">Update</button>
+								</form>
+								<form method="post" action="/@repo.user_name/@repo.name/settings/members/@item.member.id/delete">
+									<button class="danger-link-button" type="submit">Remove</button>
+								</form>
+							</div>
+						@end
+					</div>
+				@end
+			</section>
+		</div>
+		@include '../layout/footer.html'
+	</body>
+</html>

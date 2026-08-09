@@ -62,11 +62,8 @@ fn (mut app App) user_has_two_factor(user_id int) bool {
 	return tf.is_enabled
 }
 
-fn generate_totp_secret() string {
-	mut buf := []u8{len: 20}
-	for i in 0 .. buf.len {
-		buf[i] = u8(crypto_rand.int_u64(256) or { 0 })
-	}
+fn generate_totp_secret() !string {
+	buf := crypto_rand.bytes(20)!
 	enc := base32.encode_to_string(buf)
 	return enc.trim_right('=')
 }
@@ -111,7 +108,7 @@ fn verify_totp(secret string, code string) bool {
 	now := time.now().unix()
 	for offset in [i64(-1), 0, 1] {
 		expected := totp_code_for(secret, now + offset * totp_period) or { continue }
-		if expected == code {
+		if hmac.equal(expected.bytes(), code.bytes()) {
 			return true
 		}
 	}

@@ -15,8 +15,14 @@ const md_flag_tables = 0x0100
 const md_flag_strikethrough = 0x0200
 const md_flag_permissive_www_autolinks = 0x0400
 const md_flag_tasklists = 0x0800
+// Never pass repository/user supplied raw HTML through to the rendered page.
+// The previous regex based sanitizer could be bypassed with unquoted event
+// handlers and malformed/nested tags. Markdown formatting is still rendered,
+// while raw HTML is treated as ordinary text by md4c.
+const md_flag_no_html_blocks = 0x0020
+const md_flag_no_html_spans = 0x0040
 const md_flag_permissive_autolinks = md_flag_permissive_url_autolinks | md_flag_permissive_email_autolinks | md_flag_permissive_www_autolinks
-const md_dialect_github = md_flag_permissive_autolinks | md_flag_tables | md_flag_strikethrough | md_flag_tasklists
+const md_dialect_github = md_flag_permissive_autolinks | md_flag_tables | md_flag_strikethrough | md_flag_tasklists | md_flag_no_html_blocks | md_flag_no_html_spans
 
 type ProcessFn = fn (const_t &char, s u32, x voidptr)
 

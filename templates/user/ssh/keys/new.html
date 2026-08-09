@@ -12,6 +12,7 @@
 
 		<div class="content">
 			<h1>New SSH key</h1>
+			<p>Add an OpenSSH public key. Gitly verifies its binary key material and shows the SHA-256 fingerprint after saving it.</p>
 
 			<a href="/${ctx.user.username}/settings">Public profile</a>
 			|
@@ -23,6 +24,18 @@
 				</div>
 				<div class="field">
 					<textarea type="text" name="key" placeholder="SSH Key"></textarea>
+				</div>
+				<div class="field">
+					<label for="usage_type">Usage type</label>
+					<select id="usage_type" name="usage_type">
+						<option value="auth">Authentication</option>
+						<option value="signing">Signing only</option>
+						<option value="both">Authentication and signing</option>
+					</select>
+				</div>
+				<div class="field">
+					<label for="expires_at">Expiration date (optional)</label>
+					<input id="expires_at" type="date" name="expires_at">
 				</div>
 				<div class="field">
 					<input type="submit" value="Add">

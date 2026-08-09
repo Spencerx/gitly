@@ -18,6 +18,9 @@
 							.clog {
 								.clog-msg {
 									<a href='/@repo.user_name/@repo.name/tree/@branch.name'>@branch.name</a>
+									@if branch.is_protected
+										<span class="protected-branch-badge">Protected</span>
+									@end
 								}
 
 								<span >@branch.author</span>
@@ -35,4 +38,3 @@
 		@include 'layout/footer.html'
 	</body>
 </html>
-

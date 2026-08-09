@@ -8,6 +8,7 @@ mut:
 	oauth_client_id          string
 	oauth_client_secret      string
 	disable_tree_folder_size bool
+	governance_backfilled    bool
 }
 
 fn (s Settings) tree_folder_size_enabled() bool {

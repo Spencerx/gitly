@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include 'layout/head.html'
+	</head>
+	<body>
+		@include 'layout/header.html'
+
+		<div class="content">
+			<div class="profile-block-container">
+				<div class="profile-block__left">
+					<h1>@org.name</h1>
+					<p>@{org.kind.capitalize()} organization</p>
+					@if can_admin
+						<a class="issues-header__new" href="/new?owner=@org.name">New repository</a>
+					@end
+				</div>
+
+				<div class="profile-block__right">
+					<div class="profile-repos-header">
+						<h2>Repositories</h2>
+					</div>
+					@if repos.len > 0
+						<div class="profile-repo-grid">
+							@for repo in repos
+								<div class="profile-repo-card">
+									<div class="profile-repo-card__header">
+										<a class="profile-repo-card__title" href="/@org.name/@repo.name">@repo.name</a>
+										@if repo.is_public
+											<span class="profile-repo-card__badge">Public</span>
+										@else
+											<span class="profile-repo-card__badge profile-repo-card__badge--private">Private</span>
+										@end
+									</div>
+									@if repo.description.len > 0
+										<p class="profile-repo-card__desc">@repo.description</p>
+									@end
+								</div>
+							@end
+						</div>
+					@else
+						<p class="profile-repos-empty">No repositories yet.</p>
+					@end
+				</div>
+			</div>
+
+			<div class="profile-activities">
+				<h2>Members</h2>
+				@for member in members
+					<div class="activity">
+						<a href="/@member.user.username">@member.user.username</a>
+						<span class="profile-repo-card__badge">@member.role</span>
+						@if can_admin
+							<form method="post" action="/organizations/@org.name/members/@{member.user.id}/remove">
+								<button type="submit">Remove</button>
+							</form>
+						@end
+					</div>
+				@end
+
+				@if can_admin
+					<h3>Add member</h3>
+					<form method="post" action="/organizations/@org.name/members">
+						<label for="org-member-username">Username</label>
+						<input id="org-member-username" name="username" required maxlength="40">
+						<label for="org-member-role">Role</label>
+						<select id="org-member-role" name="role">
+							<option value="member">Member</option>
+							<option value="admin">Administrator</option>
+						</select>
+						<button type="submit">Add member</button>
+					</form>
+				@end
+			</div>
+		</div>
+
+		@include 'layout/footer.html'
+	</body>
+</html>

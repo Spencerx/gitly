@@ -3,13 +3,15 @@ module main
 import veb
 import os
 import git
+import rand
 
 // GET /:username/:repo_name/new/:branch_name - Show create file form
 @['/:username/:repo_name/new/:branch_name']
 pub fn (mut app App) new_file(username string, repo_name string, branch_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
-	if !ctx.logged_in || repo.user_id != ctx.user.id {
+	if !ctx.logged_in || !app.user_can_push_branch(ctx.user.id, repo, branch_name)
+		|| !is_safe_ref(branch_name) {
 		return ctx.redirect_to_repository(username, repo_name)
 	}
 
@@ -23,7 +25,7 @@ pub fn (mut app App) new_file(username string, repo_name string, branch_name str
 pub fn (mut app App) new_ci_file(username string, repo_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
-	if !ctx.logged_in || repo.user_id != ctx.user.id {
+	if !ctx.logged_in || !app.user_can_push_branch(ctx.user.id, repo, repo.primary_branch) {
 		return ctx.redirect_to_repository(username, repo_name)
 	}
 
@@ -45,7 +47,8 @@ pub fn (mut app App) new_ci_file(username string, repo_name string) veb.Result {
 pub fn (mut app App) edit_file(username string, repo_name string, branch_name string, path string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
-	if !ctx.logged_in || repo.user_id != ctx.user.id {
+	if !ctx.logged_in || !app.user_can_push_branch(ctx.user.id, repo, branch_name)
+		|| !is_safe_ref(branch_name) || !is_valid_repo_file_path(path) {
 		return ctx.redirect_to_repository(username, repo_name)
 	}
 
@@ -61,7 +64,7 @@ pub fn (mut app App) handle_update_file(username string, repo_name string) veb.R
 		return ctx.not_found()
 	}
 
-	if !ctx.logged_in || repo.user_id != ctx.user.id {
+	if !ctx.logged_in || !app.user_can_write_repo(ctx.user.id, repo) {
 		return ctx.redirect_to_repository(username, repo_name)
 	}
 
@@ -71,8 +74,9 @@ pub fn (mut app App) handle_update_file(username string, repo_name string) veb.R
 	commit_message := ctx.form['commit_message']
 	mut actual_branch := ''
 
-	if commit_message == '' {
-		ctx.error('Commit message is required')
+	if commit_message.trim_space() == '' || commit_message.len > max_commit_message_len
+		|| file_content.len > max_file_edit_size || !is_valid_repo_file_path(file_path) {
+		ctx.error('File path, content, or commit message is invalid or too long')
 		path := file_path
 		return $veb.html('templates/edit_file.html')
 	}
@@ -80,6 +84,11 @@ pub fn (mut app App) handle_update_file(username string, repo_name string) veb.R
 	actual_branch = branch_name
 	if actual_branch == '' {
 		actual_branch = repo.primary_branch
+	}
+	if !is_safe_ref(actual_branch) || !app.user_can_push_branch(ctx.user.id, repo, actual_branch) {
+		ctx.error('You are not allowed to push to this branch')
+		path := file_path
+		return $veb.html('templates/edit_file.html')
 	}
 
 	success := app.create_file_in_bare_repo(mut repo, actual_branch, file_path, file_content,
@@ -115,7 +124,7 @@ pub fn (mut app App) handle_create_file(username string, repo_name string) veb.R
 		return ctx.not_found()
 	}
 
-	if !ctx.logged_in || repo.user_id != ctx.user.id {
+	if !ctx.logged_in || !app.user_can_write_repo(ctx.user.id, repo) {
 		return ctx.redirect_to_repository(username, repo_name)
 	}
 
@@ -125,23 +134,16 @@ pub fn (mut app App) handle_create_file(username string, repo_name string) veb.R
 	commit_message := ctx.form['commit_message']
 	mut actual_branch := ''
 
-	if file_path == '' {
-		ctx.error('File path is required')
+	if !is_valid_repo_file_path(file_path) {
+		ctx.error('File path is invalid')
 		default_content := file_content
 		default_filename := file_path
 		return $veb.html('templates/new_file.html')
 	}
 
-	if commit_message == '' {
-		ctx.error('Commit message is required')
-		default_content := file_content
-		default_filename := file_path
-		return $veb.html('templates/new_file.html')
-	}
-
-	// Sanitize file path
-	if file_path.contains('..') || file_path.contains('&') || file_path.contains(';') {
-		ctx.error('Invalid file path')
+	if commit_message.trim_space() == '' || commit_message.len > max_commit_message_len
+		|| file_content.len > max_file_edit_size {
+		ctx.error('File content or commit message is invalid or too long')
 		default_content := file_content
 		default_filename := file_path
 		return $veb.html('templates/new_file.html')
@@ -150,6 +152,12 @@ pub fn (mut app App) handle_create_file(username string, repo_name string) veb.R
 	actual_branch = branch_name
 	if actual_branch == '' {
 		actual_branch = repo.primary_branch
+	}
+	if !is_safe_ref(actual_branch) || !app.user_can_push_branch(ctx.user.id, repo, actual_branch) {
+		ctx.error('You are not allowed to push to this branch')
+		default_content := file_content
+		default_filename := file_path
+		return $veb.html('templates/new_file.html')
 	}
 
 	success := app.create_file_in_bare_repo(mut repo, actual_branch, file_path, file_content,
@@ -199,14 +207,20 @@ fn (mut app App) create_file_in_bare_repo(mut repo Repo, branch string, file_pat
 		return false
 	}
 
-	// Write content to a temp file, then hash it into git
-	tmp_file := os.join_path(os.temp_dir(), 'gitly_newfile_${repo.id}_${os.getpid()}')
-	os.write_file(tmp_file, content) or {
-		app.warn('Failed to write temp file: ${err}')
+	// Use a request-unique temp directory so concurrent edits of the same
+	// repository cannot share a blob file or Git index.
+	tmp_dir := os.join_path(os.temp_dir(), 'gitly_edit_${repo.id}_${rand.ulid()}')
+	os.mkdir(tmp_dir) or {
+		app.warn('Failed to create edit temp directory: ${err}')
 		return false
 	}
 	defer {
-		os.rm(tmp_file) or {}
+		os.rmdir_all(tmp_dir) or {}
+	}
+	tmp_file := os.join_path(tmp_dir, 'content')
+	os.write_file(tmp_file, content) or {
+		app.warn('Failed to write temp file: ${err}')
+		return false
 	}
 
 	// 1. Hash the blob into the object store
@@ -234,11 +248,7 @@ fn (mut app App) create_file_in_bare_repo(mut repo Repo, branch string, file_pat
 	//    repo's own index nor a concurrent edit of the same repo is affected.
 	//    Starting from an empty index (no read-tree) handles the new-branch
 	//    case without needing `mktree`.
-	tmp_index := os.join_path(os.temp_dir(), 'gitly_index_${repo.id}_${os.getpid()}')
-	os.rm(tmp_index) or {}
-	defer {
-		os.rm(tmp_index) or {}
-	}
+	tmp_index := os.join_path(tmp_dir, 'index')
 	index_env := {
 		'GIT_INDEX_FILE': tmp_index
 	}
@@ -291,7 +301,13 @@ fn (mut app App) create_file_in_bare_repo(mut repo Repo, branch string, file_pat
 	new_commit_hash := r4.output.trim_space()
 
 	// 5. Update the branch ref
-	r5 := git.Git.exec_in_dir(git_dir, ['update-ref', 'refs/heads/${branch}', new_commit_hash])
+	mut update_args := ['update-ref', 'refs/heads/${branch}', new_commit_hash]
+	if parent_commit != '' {
+		update_args << parent_commit
+	} else {
+		update_args << '0000000000000000000000000000000000000000'
+	}
+	r5 := git.Git.exec_in_dir(git_dir, update_args)
 	if r5.exit_code != 0 {
 		app.warn('update-ref failed: ${r5.output}')
 		return false
@@ -308,8 +324,13 @@ fn is_valid_repo_file_path(path string) bool {
 	if path.len == 0 || path.len > 4096 {
 		return false
 	}
-	if path.starts_with('/') || path.starts_with('-') || path.contains('..') {
+	if path.starts_with('/') || path.starts_with('-') {
 		return false
+	}
+	for segment in path.split('/') {
+		if segment == '' || segment == '.' || segment == '..' {
+			return false
+		}
 	}
 	for c in path {
 		if c < 0x20 || c == 0x7f {

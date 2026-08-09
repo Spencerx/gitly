@@ -3,7 +3,6 @@
 module main
 
 import veb
-import validation
 
 struct DiscussionWithUser {
 	item Discussion
@@ -18,6 +17,9 @@ struct DiscussionCommentWithUser {
 @['/:username/:repo_name/discussions']
 pub fn (mut app App) handle_get_repo_discussions(mut ctx Context, username string, repo_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
 	if !app.has_user_repo_read_access(ctx, ctx.user.id, repo.id) && !repo.is_public {
 		return ctx.not_found()
 	}
@@ -39,6 +41,9 @@ pub fn (mut app App) new_discussion(mut ctx Context, username string, repo_name 
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
 	if !app.has_user_repo_read_access(ctx, ctx.user.id, repo.id) && !repo.is_public {
 		return ctx.not_found()
 	}
@@ -51,10 +56,17 @@ pub fn (mut app App) handle_create_discussion(mut ctx Context, username string, 
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	title := ctx.form['title']
 	body := ctx.form['body']
 	category := ctx.form['category']
-	if validation.is_string_empty(title) {
+	if !valid_title(title) || !valid_body(body) {
+		ctx.error('Discussion title or body is too long')
 		return ctx.redirect('/${username}/${repo_name}/discussions/new')
 	}
 	cat := if category in ['general', 'qa', 'announcement', 'idea'] { category } else { 'general' }
@@ -68,6 +80,9 @@ pub fn (mut app App) handle_create_discussion(mut ctx Context, username string, 
 @['/:username/:repo_name/discussions/:id']
 pub fn (mut app App) view_discussion(mut ctx Context, username string, repo_name string, id string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
 	if !app.has_user_repo_read_access(ctx, ctx.user.id, repo.id) && !repo.is_public {
 		return ctx.not_found()
 	}
@@ -85,8 +100,8 @@ pub fn (mut app App) view_discussion(mut ctx Context, username string, repo_name
 			user: u
 		}
 	}
-	is_owner := ctx.logged_in
-		&& (repo.user_id == ctx.user.id || discussion.author_id == ctx.user.id)
+	is_owner := ctx.logged_in && (app.can_admin_repo(ctx, repo)
+		|| discussion.author_id == ctx.user.id)
 	return $veb.html('templates/discussion.html')
 }
 
@@ -96,12 +111,18 @@ pub fn (mut app App) handle_add_discussion_comment(mut ctx Context, username str
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	discussion := app.find_discussion(id.int()) or { return ctx.not_found() }
 	if discussion.repo_id != repo.id || discussion.is_locked {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	text := ctx.form['text']
-	if validation.is_string_empty(text) {
+	if !valid_comment(text) {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	app.add_discussion_comment(discussion.id, ctx.user.id, text) or {}
@@ -114,11 +135,14 @@ pub fn (mut app App) handle_lock_discussion(mut ctx Context, username string, re
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
 	discussion := app.find_discussion(id.int()) or { return ctx.not_found() }
 	if discussion.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if repo.user_id != ctx.user.id {
+	if !app.can_admin_repo(ctx, repo) {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	app.set_discussion_lock(discussion.id, !discussion.is_locked) or {}
@@ -131,11 +155,14 @@ pub fn (mut app App) handle_delete_discussion(mut ctx Context, username string, 
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
 	discussion := app.find_discussion(id.int()) or { return ctx.not_found() }
 	if discussion.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if repo.user_id != ctx.user.id && discussion.author_id != ctx.user.id {
+	if !app.can_admin_repo(ctx, repo) && discussion.author_id != ctx.user.id {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	app.delete_discussion(discussion.id) or {}
@@ -148,13 +175,20 @@ pub fn (mut app App) handle_mark_answer(mut ctx Context, username string, repo_n
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !repo.discussions_enabled() {
+		return ctx.not_found()
+	}
 	discussion := app.find_discussion(id.int()) or { return ctx.not_found() }
 	if discussion.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if discussion.author_id != ctx.user.id && repo.user_id != ctx.user.id {
+	if discussion.author_id != ctx.user.id && !app.can_admin_repo(ctx, repo) {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
-	app.mark_discussion_answer(discussion.id, cid.int()) or {}
+	comment := app.find_discussion_comment(cid.int()) or { return ctx.not_found() }
+	if comment.discussion_id != discussion.id {
+		return ctx.not_found()
+	}
+	app.mark_discussion_answer(discussion.id, comment.id) or {}
 	return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 }

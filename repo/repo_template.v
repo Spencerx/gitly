@@ -3,14 +3,14 @@ module main
 import veb
 import git
 
-fn pick_plural_form(count int, forms []string) string {
+fn pick_plural_form(count int, forms []string, lang Lang) string {
 	if forms.len == 1 {
 		return forms[0]
 	}
-	if forms.len == 2 {
-		return if count == 1 { forms[0] } else { forms[1] }
-	}
 	n := if count < 0 { -count } else { count }
+	if forms.len == 2 || lang != .ru {
+		return if n == 1 { forms[0] } else { forms[1] }
+	}
 	last_two := n % 100
 	last := n % 10
 	if last_two >= 11 && last_two <= 14 {
@@ -53,7 +53,7 @@ fn format_thousands(n int) string {
 fn format_count(count int, key string, lang Lang) veb.RawHtml {
 	s := veb.tr(lang.str(), key).trim_space()
 	forms := s.split('|')
-	form := pick_plural_form(count, forms)
+	form := pick_plural_form(count, forms, lang)
 	return veb.RawHtml('<b>${format_thousands(count)}</b> ${form}')
 }
 

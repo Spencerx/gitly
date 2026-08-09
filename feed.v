@@ -15,23 +15,34 @@ struct FeedItem {
 
 const feed_items_per_page = 30
 
+fn (mut app App) find_accessible_watching_repo_ids(user_id int) []int {
+	mut result := []int{}
+	for repo_id in app.find_watching_repo_ids(user_id) {
+		repo := app.find_repo_by_id(repo_id) or { continue }
+		if app.user_has_repo_read_access(user_id, repo) {
+			result << repo_id
+		}
+	}
+	return result
+}
+
 fn (mut app App) build_user_feed_as_page(user_id int, offset int) []FeedItem {
 	mut feed := []FeedItem{}
-	repo_ids := app.find_watching_repo_ids(user_id)
+	repo_ids := app.find_accessible_watching_repo_ids(user_id)
 	if repo_ids.len == 0 {
 		return []
 	}
 	where_repo_ids := repo_ids.map(it.str()).join(', ')
 
 	commits := db_exec_values(mut app.db, '
-		select author, hash, created_at, repo_id, branch_id, message from ${sql_table('Commit')}
-			where repo_id in (${where_repo_ids}) order by created_at desc
+		select c.author, c.hash, c.created_at, c.repo_id, bc.branch_id, c.message
+			from ${sql_table('Commit')} c
+			join ${sql_table('BranchCommit')} bc on bc.commit_id = c.id
+			where c.repo_id in (${where_repo_ids}) order by c.created_at desc
 			limit ${feed_items_per_page} offset ${offset}') or {
 		return []
 	}
 	mut item_id := 0
-
-	println(commits)
 
 	for commit in commits {
 		vals := commit
@@ -43,7 +54,7 @@ fn (mut app App) build_user_feed_as_page(user_id int, offset int) []FeedItem {
 		commit_message := vals[5]
 
 		repo := app.find_repo_by_id(repo_id) or { continue }
-		repo_owner := app.get_username_by_id(repo.user_id) or { '' }
+		repo_owner := repo.user_name
 		branch := app.find_repo_branch_by_id(repo_id, branch_id)
 		created_at := time.unix(created_at_unix)
 
@@ -64,14 +75,14 @@ fn (mut app App) build_user_feed_as_page(user_id int, offset int) []FeedItem {
 }
 
 fn (mut app App) get_feed_items_count(user_id int) int {
-	repo_ids := app.find_watching_repo_ids(user_id)
+	repo_ids := app.find_accessible_watching_repo_ids(user_id)
 	if repo_ids.len == 0 {
 		return 0
 	}
 	where_repo_ids := repo_ids.map(it.str()).join(', ')
 
 	count_result := db_exec_values(mut app.db,
-		'select count(id) from ${sql_table('Commit')} where repo_id in (${where_repo_ids})') or {
+		'select count(c.id) from ${sql_table('Commit')} c join ${sql_table('BranchCommit')} bc on bc.commit_id = c.id where c.repo_id in (${where_repo_ids})') or {
 		return 0
 	}
 

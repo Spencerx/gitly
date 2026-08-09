@@ -15,11 +15,11 @@ pub fn (mut app App) user_feed(mut ctx Context, username string, page string) ve
 		return ctx.not_found()
 	}
 
-	page_i := page.int()
 	user_id := ctx.user.id
 	item_count := app.get_feed_items_count(user_id)
-	offset := feed_items_per_page * page_i
 	page_count := calculate_pages(item_count, feed_items_per_page)
+	page_i := normalize_page(page, page_count)
+	offset := feed_items_per_page * page_i
 	is_first_page := check_first_page(page_i)
 	is_last_page := check_last_page(item_count, offset, feed_items_per_page)
 	prev_page, next_page := generate_prev_next_pages(page_i)

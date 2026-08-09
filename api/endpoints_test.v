@@ -37,6 +37,9 @@ const test_username = 'apitester'
 const test_password = '1234zxcv'
 const test_email = 'apitester@example.com'
 const test_repo = 'apitest'
+const test_private_repo = 'private-api-test'
+const test_org = 'api-test-org'
+const test_org_repo = 'private-org-test'
 const test_other_user = 'apitester2'
 const test_other_password = '5678qwer'
 const test_other_email = 'apitester2@example.com'
@@ -92,6 +95,16 @@ fn testsuite_begin() {
 	os.setenv(env_bearer, token, true)
 
 	create_repo(session, test_repo) or { fail('create repo: ${err}') }
+	create_repo_with_owner(session, test_private_repo, 'private', test_username) or {
+		fail('create private repo: ${err}')
+	}
+	create_organization(session, test_org) or { fail('create organization: ${err}') }
+	add_organization_member(session, test_org, test_other_user) or {
+		fail('add organization member: ${err}')
+	}
+	create_repo_with_owner(session, test_org_repo, 'private', test_org) or {
+		fail('create private organization repo: ${err}')
+	}
 
 	rid := fetch_test_repo_id() or { fail('fetch repo id: ${err}') }
 	os.setenv(env_repo_id, rid.str(), true)
@@ -116,13 +129,16 @@ fn chdir_to_project_root() {
 }
 
 fn cleanup_test_state() {
+	if os.exists(test_binary) {
+		os.rm(test_binary) or {}
+	}
 	for ext in ['', '-shm', '-wal'] {
 		path := test_sqlite_path + ext
 		if os.exists(path) {
 			os.rm(path) or {}
 		}
 	}
-	for user in [test_username, test_other_user] {
+	for user in [test_username, test_other_user, test_org] {
 		repo_path := os.join_path('repos', user)
 		if os.exists(repo_path) {
 			os.rmdir_all(repo_path) or {}
@@ -131,9 +147,6 @@ fn cleanup_test_state() {
 }
 
 fn ensure_gitly_binary() {
-	if os.exists(test_binary) {
-		return
-	}
 	log.info('building ${test_binary} ...')
 	res := os.execute('v -d sqlite -d use_libbacktrace -d use_openssl -o ${test_binary} .')
 	if res.exit_code != 0 {
@@ -181,6 +194,16 @@ fn extract_token_cookie(h http.Header) string {
 	return ''
 }
 
+fn extract_cookie(h http.Header, name string) string {
+	for v in h.values(.set_cookie) {
+		value := v.find_between('${name}=', ';')
+		if value != '' {
+			return value
+		}
+	}
+	return ''
+}
+
 fn register(username string, password string, email string) !string {
 	body := 'username=${username}&password=${password}&email=${email}&no_redirect=1'
 	resp := http.post(url('/register'), body)!
@@ -195,16 +218,50 @@ fn register(username string, password string, email string) !string {
 }
 
 fn create_repo(token string, name string) ! {
+	return create_repo_with_owner(token, name, 'public', test_username)
+}
+
+fn create_repo_with_owner(token string, name string, visibility string, owner string) ! {
 	resp := http.fetch(
 		method:  .post
 		url:     url('/new')
 		cookies: {
 			'token': token
 		}
-		data:    'name=${name}&description=api+test&clone_url=&repo_visibility=public&no_redirect=1'
+		data:    'name=${name}&description=api+test&clone_url=&repo_visibility=${visibility}&owner=${owner}&no_redirect=1'
 	)!
 	if resp.status_code != 200 || resp.body != 'ok' {
 		return error('unexpected response ${resp.status_code}: ${resp.body}')
+	}
+}
+
+fn create_organization(token string, name string) ! {
+	resp := http.fetch(
+		method:         .post
+		url:            url('/organizations/new')
+		cookies:        {
+			'token': token
+		}
+		data:           'org_name=${name}&contact_email=org%40example.com&org_kind=personal&accept_terms=1'
+		allow_redirect: false
+	)!
+	if resp.status_code != 302 && resp.status_code != 303 {
+		return error('organization create returned ${resp.status_code}: ${resp.body}')
+	}
+}
+
+fn add_organization_member(token string, org_name string, username string) ! {
+	resp := http.fetch(
+		method:         .post
+		url:            url('/organizations/${org_name}/members')
+		cookies:        {
+			'token': token
+		}
+		data:           'username=${username}&role=member'
+		allow_redirect: false
+	)!
+	if resp.status_code != 302 && resp.status_code != 303 {
+		return error('add organization member returned ${resp.status_code}: ${resp.body}')
 	}
 }
 
@@ -222,9 +279,12 @@ fn create_api_token(token string, username string) !string {
 		return error('expected redirect, got ${resp.status_code}: ${resp.body}')
 	}
 	location := resp.header.get(.location) or { return error('no Location header') }
-	plain := location.all_after('new_token=')
-	if plain == '' || plain == location {
-		return error('could not parse new_token from ${location}')
+	if location.contains('new_token=') {
+		return error('API token leaked in redirect URL: ${location}')
+	}
+	plain := extract_cookie(resp.header, 'new_api_token')
+	if plain == '' {
+		return error('no one-time API token cookie in response')
 	}
 	return plain
 }
@@ -243,20 +303,20 @@ fn fetch_test_repo_id() !int {
 	return error('repo not found in listing')
 }
 
-struct ApiRepoSummary {
+pub struct ApiRepoSummary {
 	id        int
 	name      string
 	user_name string
 }
 
-struct ApiUserSummary {
+pub struct ApiUserSummary {
 	id        int
 	username  string
 	full_name string
 	avatar    string
 }
 
-struct ApiIssueSummary {
+pub struct ApiIssueSummary {
 	id      int
 	number  int
 	repo_id int
@@ -266,7 +326,7 @@ struct ApiIssueSummary {
 	status  string
 }
 
-struct ApiPullSummary {
+pub struct ApiPullSummary {
 	id          int
 	repo_id     int
 	title       string
@@ -274,23 +334,38 @@ struct ApiPullSummary {
 	status      string
 }
 
-struct ApiCommentSummary {
+pub struct ApiCommentSummary {
 	id     int
 	author string
 	text   string
 }
 
-struct ApiBoolResult {
+pub struct ApiProjectMemberSummary {
+	id           int
+	user_id      int
+	username     string
+	role         string
+	access_level int
+}
+
+pub struct ApiProtectedBranchSummary {
+	id           int
+	pattern      string
+	push_access  int
+	merge_access int
+}
+
+pub struct ApiBoolResult {
 	success bool
 	result  bool
 }
 
-struct ApiFilesResult {
+pub struct ApiFilesResult {
 	success bool
 	result  []FileSummary
 }
 
-struct FileSummary {
+pub struct FileSummary {
 	name      string
 	last_msg  string
 	last_hash string
@@ -452,11 +527,9 @@ fn test_api_v1_pull_comments_not_found() {
 
 fn test_api_v1_issues_count() {
 	resp := http.fetch(
-		method:  .get
-		url:     url('/api/v1/${test_username}/${test_repo}/issues/count')
-		cookies: {
-			'token': session_cookie()
-		}
+		method: .get
+		url:    url('/api/v1/${test_username}/${test_repo}/issues/count')
+		header: bearer_header()
 	) or { panic(err) }
 	assert resp.status_code == 200
 	decoded := json.decode[ApiIssueCount](resp.body) or { panic(err) }
@@ -464,18 +537,18 @@ fn test_api_v1_issues_count() {
 	assert decoded.result >= 1
 }
 
-fn test_api_v1_issues_count_unauthenticated() {
+fn test_api_v1_public_issues_count_is_accessible_unauthenticated() {
 	resp := http.get(url('/api/v1/${test_username}/${test_repo}/issues/count')) or { panic(err) }
-	assert resp.body.contains('Not found')
+	decoded := json.decode[ApiIssueCount](resp.body) or { panic(err) }
+	assert decoded.success
+	assert decoded.result >= 1
 }
 
 fn test_api_v1_branches_count() {
 	resp := http.fetch(
-		method:  .get
-		url:     url('/api/v1/${test_username}/${test_repo}/branches/count')
-		cookies: {
-			'token': session_cookie()
-		}
+		method: .get
+		url:    url('/api/v1/${test_username}/${test_repo}/branches/count')
+		header: bearer_header()
 	) or { panic(err) }
 	assert resp.status_code == 200
 	decoded := json.decode[ApiBranchCount](resp.body) or { panic(err) }
@@ -485,11 +558,9 @@ fn test_api_v1_branches_count() {
 
 fn test_api_v1_commits_count() {
 	resp := http.fetch(
-		method:  .get
-		url:     url('/api/v1/${test_username}/${test_repo}/main/commits/count')
-		cookies: {
-			'token': session_cookie()
-		}
+		method: .get
+		url:    url('/api/v1/${test_username}/${test_repo}/main/commits/count')
+		header: bearer_header()
 	) or { panic(err) }
 	assert resp.status_code == 200
 	decoded := json.decode[ApiCommitCount](resp.body) or { panic(err) }
@@ -500,11 +571,9 @@ fn test_api_v1_commits_count() {
 fn test_api_v1_repo_star_toggle() {
 	rid := repo_id()
 	resp := http.fetch(
-		method:  .post
-		url:     url('/api/v1/repos/${rid}/star')
-		cookies: {
-			'token': session_cookie()
-		}
+		method: .post
+		url:    url('/api/v1/repos/${rid}/star')
+		header: bearer_header()
 	) or { panic(err) }
 	assert resp.status_code == 200
 	first := json.decode[ApiBoolResult](resp.body) or { panic(err) }
@@ -512,11 +581,9 @@ fn test_api_v1_repo_star_toggle() {
 	assert first.result == true
 
 	resp2 := http.fetch(
-		method:  .post
-		url:     url('/api/v1/repos/${rid}/star')
-		cookies: {
-			'token': session_cookie()
-		}
+		method: .post
+		url:    url('/api/v1/repos/${rid}/star')
+		header: bearer_header()
 	) or { panic(err) }
 	second := json.decode[ApiBoolResult](resp2.body) or { panic(err) }
 	assert second.result == false
@@ -525,11 +592,9 @@ fn test_api_v1_repo_star_toggle() {
 fn test_api_v1_repo_watch_toggle() {
 	rid := repo_id()
 	resp := http.fetch(
-		method:  .post
-		url:     url('/api/v1/repos/${rid}/watch')
-		cookies: {
-			'token': session_cookie()
-		}
+		method: .post
+		url:    url('/api/v1/repos/${rid}/watch')
+		header: bearer_header()
 	) or { panic(err) }
 	assert resp.status_code == 200
 	first := json.decode[ApiBoolResult](resp.body) or { panic(err) }
@@ -570,7 +635,7 @@ fn test_api_v1_users_avatar_requires_auth() {
 	assert resp.status_code == 404
 }
 
-fn test_api_v1_ci_status_callback() {
+fn test_api_v1_ci_status_callback_requires_signature() {
 	rid := repo_id()
 	payload := '{"run_id":"123","repo_id":"${rid}","commit_hash":"deadbeef","branch":"main","status":"running"}'
 	resp := http.fetch(
@@ -579,8 +644,8 @@ fn test_api_v1_ci_status_callback() {
 		header: http.new_header(key: .content_type, value: 'application/json')
 		data:   payload
 	) or { panic(err) }
-	assert resp.status_code == 200
-	assert resp.body.contains('"success":true') || resp.body.contains('"success": true')
+	assert resp.status_code == 401
+	assert resp.body.contains('Invalid or missing CI callback signature')
 }
 
 fn test_api_v1_ci_status_callback_rejects_bad_json() {
@@ -590,11 +655,12 @@ fn test_api_v1_ci_status_callback_rejects_bad_json() {
 		header: http.new_header(key: .content_type, value: 'application/json')
 		data:   'not-json'
 	) or { panic(err) }
-	assert resp.body.contains('Invalid request body')
+	assert resp.status_code == 401
+	assert resp.body.contains('Invalid or missing CI callback signature')
 }
 
 fn test_api_v1_private_repo_visibility_from_other_user() {
-	// Sanity check: a second authenticated user can see the public test repo.
+	// A second authenticated user can see the public test repo.
 	resp := http.fetch(
 		method:  .get
 		url:     url('/api/v1/repos/${test_username}/${test_repo}')
@@ -603,4 +669,98 @@ fn test_api_v1_private_repo_visibility_from_other_user() {
 		}
 	) or { panic(err) }
 	assert resp.status_code == 200
+
+	private_resp := http.fetch(
+		method:  .get
+		url:     url('/api/v1/repos/${test_username}/${test_private_repo}')
+		cookies: {
+			'token': other_session_cookie()
+		}
+	) or { panic(err) }
+	assert private_resp.status_code == 404
+
+	owner_resp := http.fetch(
+		method: .get
+		url:    url('/api/v1/repos/${test_username}/${test_private_repo}')
+		header: bearer_header()
+	) or { panic(err) }
+	assert owner_resp.status_code == 200
+}
+
+fn test_api_v1_organization_member_can_read_private_repo() {
+	member_resp := http.fetch(
+		method:  .get
+		url:     url('/api/v1/repos/${test_org}/${test_org_repo}')
+		cookies: {
+			'token': other_session_cookie()
+		}
+	) or { panic(err) }
+	assert member_resp.status_code == 200
+
+	anon_resp := http.get(url('/api/v1/repos/${test_org}/${test_org_repo}')) or { panic(err) }
+	assert anon_resp.status_code == 404
+}
+
+fn test_api_v1_project_members_and_role_based_private_access() {
+	create := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/${test_username}/${test_private_repo}/members')
+		header: http.new_header_from_map({
+			.authorization: 'Bearer ${bearer_token()}'
+			.content_type:  'application/x-www-form-urlencoded'
+		})
+		data:   'username=${test_other_user}&role=reporter'
+	) or { panic(err) }
+	assert create.status_code == 200
+	member := json.decode[ApiProjectMemberSummary](create.body) or { panic(err) }
+	assert member.username == test_other_user
+	assert member.role == 'reporter'
+	assert member.access_level == 20
+
+	listing := http.fetch(
+		method:  .get
+		url:     url('/api/v1/repos/${test_username}/${test_private_repo}/members')
+		cookies: {
+			'token': other_session_cookie()
+		}
+	) or { panic(err) }
+	assert listing.status_code == 200
+	members := json.decode[[]ApiProjectMemberSummary](listing.body) or { panic(err) }
+	assert members.any(it.username == test_other_user && it.role == 'reporter')
+
+	private_repo := http.fetch(
+		method:  .get
+		url:     url('/api/v1/repos/${test_username}/${test_private_repo}')
+		cookies: {
+			'token': other_session_cookie()
+		}
+	) or { panic(err) }
+	assert private_repo.status_code == 200
+}
+
+fn test_api_v1_protected_branches() {
+	create := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/${test_username}/${test_repo}/protected-branches')
+		header: http.new_header_from_map({
+			.authorization: 'Bearer ${bearer_token()}'
+			.content_type:  'application/x-www-form-urlencoded'
+		})
+		data:   'pattern=release%2F*&push_access=40&merge_access=30'
+	) or { panic(err) }
+	assert create.status_code == 200
+	rule := json.decode[ApiProtectedBranchSummary](create.body) or { panic(err) }
+	assert rule.pattern == 'release/*'
+	assert rule.push_access == 40
+	assert rule.merge_access == 30
+
+	listing := http.fetch(
+		method: .get
+		url:    url('/api/v1/repos/${test_username}/${test_repo}/protected-branches')
+		header: bearer_header()
+	) or { panic(err) }
+	assert listing.status_code == 200
+	rules := json.decode[[]ApiProtectedBranchSummary](listing.body) or { panic(err) }
+	assert rules.any(it.pattern == 'master')
+	assert rules.any(it.pattern == 'release/*')
 }

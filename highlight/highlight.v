@@ -12,7 +12,7 @@ pub fn highlight_text(st string, file_path string, commit bool) (string, int, in
 		if file_extension == 'md' {
 			return convert_markdown_to_html(st), 0, 0
 		} else if file_extension == 'txt' {
-			return st, 0, 0
+			return escape_html(st), 0, 0
 		}
 	}
 

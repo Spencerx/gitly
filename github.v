@@ -7,6 +7,8 @@ import x.json2 as json
 import net.http
 import time
 import git
+import validation
+import crypto.hmac
 // import veb.auth as oauth
 import veb.oauth
 
@@ -15,6 +17,18 @@ struct GitHubUser {
 	name     string
 	email    string
 	avatar   string @[json: 'avatar_url']
+}
+
+struct GitHubAccessToken {
+	access_token      string
+	error             string
+	error_description string
+}
+
+struct GitHubEmail {
+	email    string
+	primary  bool
+	verified bool
 }
 
 struct GitHubIssueAuthor {
@@ -134,20 +148,27 @@ fn is_github_clone_url(clone_url string) bool {
 // "shadow" user (no password, no email, just the username and GitHub avatar)
 // when one does not yet exist.
 fn (mut app App) find_or_create_github_shadow_user(github_login string) !int {
-	if u := app.get_user_by_username(github_login) {
-		return u.id
+	login := github_login.trim_space().to_lower()
+	if !validation.is_username_valid(login) || is_reserved_account_name(login) {
+		return error('invalid GitHub username')
+	}
+	if u := app.get_user_by_username(login) {
+		if u.is_github {
+			return u.id
+		}
+		return error('GitHub username collides with an unlinked local account')
 	}
 	user := User{
-		username:        github_login
-		github_username: github_login
+		username:        login
+		github_username: login
 		is_github:       true
 		is_registered:   false
-		avatar:          'https://github.com/${github_login}.png'
+		avatar:          'https://github.com/${login}.png'
 		created_at:      time.now()
 	}
 	app.add_user(user)!
-	created := app.get_user_by_username(github_login) or {
-		return error('shadow user not found after insert: ${github_login}')
+	created := app.get_user_by_username(login) or {
+		return error('shadow user not found after insert: ${login}')
 	}
 	return created.id
 }
@@ -315,21 +336,32 @@ fn (mut app App) import_github_pull_requests(repo Repo, owner_user_id int) ! {
 // find_or_create_github_shadow_contributor is like find_or_create_github_shadow_user
 // but also stores the GitHub avatar URL when given.
 fn (mut app App) find_or_create_github_shadow_contributor(github_login string, avatar_url string) !int {
-	if u := app.get_user_by_username(github_login) {
-		return u.id
+	login := github_login.trim_space().to_lower()
+	if !validation.is_username_valid(login) || is_reserved_account_name(login) {
+		return error('invalid GitHub username')
 	}
-	avatar := if avatar_url != '' { avatar_url } else { 'https://github.com/${github_login}.png' }
+	if u := app.get_user_by_username(login) {
+		if u.is_github {
+			return u.id
+		}
+		return error('GitHub username collides with an unlinked local account')
+	}
+	avatar := if avatar_url.starts_with('https://avatars.githubusercontent.com/') {
+		avatar_url
+	} else {
+		'https://github.com/${login}.png'
+	}
 	user := User{
-		username:        github_login
-		github_username: github_login
+		username:        login
+		github_username: login
 		is_github:       true
 		is_registered:   false
 		avatar:          avatar
 		created_at:      time.now()
 	}
 	app.add_user(user)!
-	created := app.get_user_by_username(github_login) or {
-		return error('shadow user not found after insert: ${github_login}')
+	created := app.get_user_by_username(login) or {
+		return error('shadow user not found after insert: ${login}')
 	}
 	return created.id
 }
@@ -420,98 +452,159 @@ fn (mut app App) import_github_issues(repo_id int, clone_url string, owner_user_
 	eprintln('[github-import] done: imported ${total} issues into repo ${repo_id}')
 }
 
+fn configured_github_request(method http.Method, url string, body string) http.Request {
+	mut req := http.new_request(method, url, body)
+	req.read_timeout = 10 * time.second
+	req.write_timeout = 10 * time.second
+	req.allow_redirect = false
+	req.max_retries = 1
+	req.stop_receiving_limit = 1024 * 1024
+	req.add_header(.user_agent, 'gitly')
+	return req
+}
+
+fn (mut app App) exchange_github_oauth_code(code string, state string) !string {
+	payload := json.encode(oauth.Request{
+		client_id:     app.settings.oauth_client_id
+		client_secret: app.settings.oauth_client_secret
+		code:          code
+		state:         state
+	})
+	mut req := configured_github_request(.post, 'https://github.com/login/oauth/access_token',
+		payload)
+	req.add_header(.content_type, 'application/json')
+	req.add_header(.accept, 'application/json')
+	resp := req.do()!
+	if resp.status_code != 200 {
+		return error('GitHub token exchange returned ${resp.status_code}')
+	}
+	result := json.decode[GitHubAccessToken](resp.body)!
+	if result.access_token == '' || result.access_token.len > 512 {
+		return error(if result.error_description != '' {
+			result.error_description
+		} else {
+			'GitHub did not return an access token'
+		})
+	}
+	return result.access_token
+}
+
+fn github_api_get(path string, token string) !http.Response {
+	mut req := configured_github_request(.get, 'https://api.github.com${path}', '')
+	req.add_header(.authorization, 'Bearer ${token}')
+	req.add_header(.accept, 'application/vnd.github+json')
+	resp := req.do()!
+	if resp.status_code != 200 {
+		return error('GitHub API returned ${resp.status_code}')
+	}
+	return resp
+}
+
+fn github_primary_email(token string) !string {
+	resp := github_api_get('/user/emails', token)!
+	emails := json.decode[[]GitHubEmail](resp.body)!
+	for item in emails {
+		if item.primary && item.verified && validation.is_email_valid(item.email) {
+			return item.email.trim_space().to_lower()
+		}
+	}
+	for item in emails {
+		if item.verified && validation.is_email_valid(item.email) {
+			return item.email.trim_space().to_lower()
+		}
+	}
+	return error('GitHub account has no verified email address')
+}
+
 @['/oauth']
 pub fn (mut app App) handle_oauth() veb.Result {
 	code := ctx.query['code']
 	state := ctx.query['state']
-
-	if code == '' {
+	if code == '' || code.len > 1024 || state.len > 256 {
 		app.add_security_log(user_id: ctx.user.id, kind: .empty_oauth_code) or {
 			app.info(err.str())
 		}
-		app.info('Code is empty')
-
-		return ctx.redirect_to_index()
+		return ctx.redirect_to_login()
 	}
 
-	csrf := ctx.get_cookie('csrf') or { return ctx.redirect_to_index() }
-	if csrf != state || csrf == '' {
+	csrf := ctx.get_cookie('csrf') or { return ctx.redirect_to_login() }
+	if csrf == '' || !hmac.equal(csrf.bytes(), state.bytes()) {
 		app.add_security_log(
 			user_id: ctx.user.id
 			kind:    .wrong_oauth_state
-			arg1:    'csrf=${csrf}'
-			arg2:    'state=${state}'
+			arg1:    'OAuth state did not match the browser session'
 		) or { app.info(err.str()) }
+		return ctx.redirect_to_login()
+	}
+	// Make state single-use before contacting GitHub. A failed exchange starts a
+	// fresh login instead of leaving a replayable state cookie behind.
+	ctx.set_cookie(
+		name:      'csrf'
+		value:     ''
+		path:      '/'
+		max_age:   -1
+		http_only: true
+		same_site: .same_site_lax_mode
+		secure:    app.config.cookie_secure
+	)
 
-		return ctx.redirect_to_index()
+	token := app.exchange_github_oauth_code(code, csrf) or {
+		app.warn('GitHub OAuth token exchange failed: ${err}')
+		return ctx.redirect_to_login()
+	}
+	user_response := github_api_get('/user', token) or {
+		app.warn('GitHub OAuth user lookup failed: ${err}')
+		return ctx.redirect_to_login()
+	}
+	github_user := json.decode[GitHubUser](user_response.body) or { return ctx.redirect_to_login() }
+	username := github_user.username.trim_space().to_lower()
+	if !validation.is_username_valid(username) || is_reserved_account_name(username) {
+		return ctx.redirect_to_login()
+	}
+	mut email := github_user.email.trim_space().to_lower()
+	if !validation.is_email_valid(email) {
+		email = github_primary_email(token) or {
+			app.add_security_log(
+				user_id: ctx.user.id
+				kind:    .empty_oauth_email
+				arg1:    'GitHub account did not provide a verified email'
+			) or { app.info(err.str()) }
+			return ctx.redirect_to_login()
+		}
 	}
 
-	oauth_request := oauth.Request{
-		client_id:     app.settings.oauth_client_id
-		client_secret: app.settings.oauth_client_secret
-		code:          code
-		state:         csrf
+	mut user := app.get_user_by_github_username(username) or { User{} }
+	if user.id != 0 && !user.is_github {
+		// Legacy local accounts used to have github_username=username even
+		// though they had never linked GitHub. Never authenticate such a row.
+		app.warn('Rejected GitHub OAuth collision for local account ${username}')
+		return ctx.redirect_to_login()
 	}
-
-	js := json.encode(oauth_request)
-	access_response := http.post_json('https://github.com/login/oauth/access_token', js) or {
-		app.info(err.msg())
-
-		return ctx.redirect_to_index()
-	}
-
-	mut token := access_response.body.find_between('access_token=', '&')
-	mut request := http.new_request(.get, 'https://api.github.com/user', '')
-	request.add_header(.authorization, 'token ${token}')
-
-	user_response := request.do() or {
-		app.info(err.msg())
-
-		return ctx.redirect_to_index()
-	}
-
-	if user_response.status_code != 200 {
-		app.info(user_response.status_code.str())
-		app.info(user_response.body)
-		return ctx.text('Received ${user_response.status_code} error while attempting to contact GitHub')
-	}
-
-	github_user := json.decode[GitHubUser](user_response.body) or { return ctx.redirect_to_index() }
-
-	if github_user.email.trim_space().len == 0 {
-		app.add_security_log(
-			user_id: ctx.user.id
-			kind:    .empty_oauth_email
-			arg1:    user_response.body
-		) or { app.info(err.str()) }
-		app.info('Email is empty')
-	}
-
-	mut user := app.get_user_by_github_username(github_user.username) or { User{} }
-
-	if !user.is_github {
-		// Register a new user via github
+	if user.id == 0 || !user.is_registered {
+		app.register_user(username, '', '', [email], true, false) or {
+			app.warn('GitHub OAuth registration failed for ${username}: ${err}')
+			return ctx.redirect_to_login()
+		}
+		user = app.get_user_by_github_username(username) or { return ctx.redirect_to_login() }
 		app.add_security_log(
 			user_id: user.id
 			kind:    .registered_via_github
-			arg1:    user_response.body
+			arg1:    username
 		) or { app.info(err.str()) }
-
-		app.register_user(github_user.username, '', '', [github_user.email], true, false) or {
-			app.info(err.msg())
-		}
-
-		user = app.get_user_by_github_username(github_user.username) or {
-			return ctx.redirect_to_index()
-		}
-
+	}
+	if user.is_blocked || !user.is_registered || !user.is_github {
+		return ctx.redirect_to_login()
+	}
+	if github_user.avatar.starts_with('https://avatars.githubusercontent.com/') {
 		app.update_user_avatar(user.id, github_user.avatar) or { app.info(err.msg()) }
 	}
 
-	app.auth_user(mut ctx, user, ctx.ip()) or { app.info(err.msg()) }
-	app.add_security_log(user_id: user.id, kind: .logged_in_via_github, arg1: user_response.body) or {
+	app.auth_user(mut ctx, user, ctx.ip()) or {
+		app.warn('GitHub OAuth session creation failed for user ${user.id}: ${err}')
+		return ctx.redirect_to_login()
+	}
+	app.add_security_log(user_id: user.id, kind: .logged_in_via_github, arg1: username) or {
 		app.info(err.str())
 	}
-
-	return ctx.redirect_to_index()
+	return ctx.redirect('/${user.username}')
 }

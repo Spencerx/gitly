@@ -3,6 +3,7 @@
 module main
 
 import os
+import validation
 
 pub fn (mut app App) command_fetcher() ! {
 	for {
@@ -14,11 +15,23 @@ pub fn (mut app App) command_fetcher() ! {
 			if args.len > 0 {
 				match args[0] {
 					'adduser' {
-						if args.len > 4 {
-							app.register_user(args[1], args[2], args[3], args[4..], false, false)!
-							println('Added user ${args[1]}')
+						if args.len >= 4 {
+							username := args[1].trim_space().to_lower()
+							password := args[2]
+							emails := args[3..].map(it.trim_space().to_lower())
+							if !validation.is_username_valid(username) || password.len < 8
+								|| password.len > max_password_len {
+								return error('Invalid username or password (password must be 8-${max_password_len} characters)')
+							}
+							salt := generate_salt()
+							hashed := hash_password_with_salt(password, salt)
+							if hashed == '' {
+								return error('Could not hash password')
+							}
+							app.register_user(username, hashed, salt, emails, false, false)!
+							println('Added user ${username}')
 						} else {
-							error('Not enough arguments (3 required but only ${args.len} given)')
+							return error('Usage: !adduser <username> <password> <email1> [email2...]')
 						}
 					}
 					else {

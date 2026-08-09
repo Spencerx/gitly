@@ -4,6 +4,7 @@ import crypto.sha256
 import crypto.bcrypt
 import time
 import os
+import validation
 
 // bcrypt_cost is the work factor for password hashing. 12 is a good balance of
 // security and speed on current hardware.
@@ -61,7 +62,7 @@ pub fn (mut app App) set_user_admin_status(user_id int, status bool) ! {
 // generates and embeds its own random salt with a tunable cost factor, so the
 // `salt` argument is ignored for new hashes (kept only so existing callers and
 // the User.salt column are unaffected).
-fn hash_password_with_salt(password string, salt string) string {
+fn hash_password_with_salt(password string, _salt string) string {
 	return bcrypt.generate_from_password(password.bytes(), bcrypt_cost) or { '' }
 }
 
@@ -108,95 +109,103 @@ fn (mut app App) update_user_password_hash(user_id int, hashed string) ! {
 }
 
 pub fn (mut app App) register_user(username string, password string, salt string, emails []string, github bool, is_admin bool) !bool {
-	mut user := app.get_user_by_username(username) or { User{} }
-
-	if user.id != 0 && user.is_registered {
-		app.info('User ${username} already exists')
-		return error('username `${username}` is already taken')
+	if emails.len == 0 {
+		return error('at least one email address is required')
+	}
+	account_name := username.trim_space().to_lower()
+	if !validation.is_username_valid(account_name) || is_reserved_account_name(account_name) {
+		return error('username `${account_name}` is not available')
+	}
+	if _ := app.get_org_by_name(account_name) {
+		return error('username `${account_name}` is already taken')
 	}
 
-	// A non-registered row with this username exists (e.g. a GitHub shadow user).
-	// Block normal registration; the GitHub flow handles upgrading shadow users itself.
-	if user.id != 0 && !github {
-		app.info('Username ${username} is reserved by an unregistered/shadow user')
-		return error('username `${username}` is already taken')
-	}
-
-	user = app.get_user_by_email(emails[0]) or { User{} }
-
-	if user.id != 0 && user.is_registered {
-		app.info('Email ${emails[0]} is already in use')
-		return error('email `${emails[0]}` is already in use')
-	}
-
-	if user.id == 0 {
-		// Final guard: make sure no Email row points at this address even if
-		// the parent user lookup didn't surface (orphaned/duplicate rows).
-		if app.email_exists(emails[0]) {
-			return error('email `${emails[0]}` is already in use')
+	mut clean_emails := []string{cap: emails.len}
+	for raw_email in emails {
+		email := raw_email.trim_space().to_lower()
+		if !validation.is_email_valid(email) || email in clean_emails {
+			return error('email `${email}` is invalid or duplicated')
 		}
+		clean_emails << email
+	}
 
-		user = User{
-			username:        username
-			password:        password
-			salt:            salt
-			created_at:      time.now()
-			is_registered:   true
-			is_github:       github
-			github_username: username
-			avatar:          default_avatar_name
-			is_admin:        is_admin
+	username_user := app.get_user_by_username(account_name) or { User{} }
+	if username_user.id != 0 && username_user.is_registered {
+		return error('username `${account_name}` is already taken')
+	}
+	if username_user.id != 0 && !github {
+		return error('username `${account_name}` is already taken')
+	}
+
+	for email in clean_emails {
+		if email_user := app.get_user_by_email(email) {
+			if email_user.id != username_user.id {
+				return error('email `${email}` is already in use')
+			}
 		}
+	}
 
-		app.add_user(user) or {
+	// GitHub imports create unregistered shadow users. OAuth is allowed to
+	// upgrade only that exact shadow row; it must never attach a GitHub handle
+	// to an existing password account with the same name.
+	if username_user.id != 0 {
+		for email in clean_emails {
+			if !app.email_exists(email) {
+				app.add_email(username_user.id, email)!
+			}
+		}
+		id := username_user.id
+		sql app.db {
+			update User set is_registered = true, is_github = true, github_username = account_name
+			where id == id
+		}!
+		app.add_activity(id, 'joined') or { app.info('could not record joined activity: ${err}') }
+		app.create_user_dir(account_name)
+		return true
+	}
+
+	// A final all-address check narrows the race window before insertion. The
+	// unique database constraints remain authoritative if requests race.
+	for email in clean_emails {
+		if app.email_exists(email) {
+			return error('email `${email}` is already in use')
+		}
+	}
+
+	user := User{
+		username:        account_name
+		password:        password
+		salt:            salt
+		created_at:      time.now()
+		is_registered:   true
+		is_github:       github
+		github_username: if github { account_name } else { '' }
+		avatar:          default_avatar_name
+		is_admin:        is_admin
+	}
+
+	app.add_user(user) or {
+		if is_unique_constraint_error(err) {
+			return error('username `${account_name}` or email `${clean_emails[0]}` is already in use')
+		}
+		return err
+	}
+
+	created := app.get_user_by_username(account_name) or {
+		return error('user `${account_name}` was not found after insert')
+	}
+	for email in clean_emails {
+		app.add_email(created.id, email) or {
 			if is_unique_constraint_error(err) {
-				return error('username `${username}` or email `${emails[0]}` is already in use')
+				return error('email `${email}` is already in use')
 			}
 			return err
 		}
-
-		mut u := app.get_user_by_username(user.username) or {
-			app.info('User was not inserted')
-			return error('user `${username}` was not inserted (lookup after insert failed: ${err})')
-		}
-
-		if u.password != user.password {
-			app.info('User was not inserted (password mismatch after insert)')
-			return error('user `${username}` was not inserted (password mismatch after insert)')
-		}
-		if u.username != user.username {
-			app.info('User was not inserted (username mismatch after insert)')
-			return error('user `${username}` was not inserted (username mismatch after insert: got `${u.username}`)')
-		}
-
-		app.add_activity(u.id, 'joined')!
-
-		for email in emails {
-			app.add_email(u.id, email) or {
-				if is_unique_constraint_error(err) {
-					return error('email `${email}` is already in use')
-				}
-				return err
-			}
-		}
-
-		u.emails = app.find_user_emails(u.id)
-	} else {
-		// Update existing user
-		if !github {
-			app.create_user_dir(username)
-
-			return true
-		}
-
-		if user.is_registered {
-			sql app.db {
-				update User set is_github = true where id == user.id
-			}!
-			return true
-		}
 	}
-	app.create_user_dir(username)
+	app.add_activity(created.id, 'joined') or {
+		app.info('could not record joined activity: ${err}')
+	}
+	app.create_user_dir(account_name)
 
 	return true
 }
@@ -371,7 +380,7 @@ pub fn (mut app App) get_all_registered_user_count() int {
 fn (mut app App) search_users(query string) []User {
 	q :=
 		'select id, full_name, username, avatar from ${sql_table('User')} where is_blocked is false and ' +
-		'(username like ${sql_like_pattern(query)} or full_name like ${sql_like_pattern(query)})'
+		'(username like ${sql_like_pattern(query)} or full_name like ${sql_like_pattern(query)}) limit ${search_results_limit}'
 	repo_rows := db_exec_values(mut app.db, q) or { return [] }
 	mut users := []User{}
 	for row in repo_rows {
@@ -441,13 +450,13 @@ pub fn (mut app App) check_user_blocked(user_id int) bool {
 	return user.is_blocked
 }
 
-fn (mut app App) change_username(user_id int, username string) ! {
+fn (mut app App) change_username(user_id int, old_username string, username string) ! {
 	sql app.db {
 		update User set username = username where id == user_id
 	}!
 
 	sql app.db {
-		update Repo set user_name = username where user_id == user_id
+		update Repo set user_name = username where user_id == user_id && user_name == old_username
 	}!
 }
 
@@ -476,7 +485,7 @@ fn (mut app App) check_username(username string) (bool, User) {
 pub fn (mut app App) auth_user(mut ctx Context, user User, ip string) ! {
 	token := app.add_token(user.id, ip)!
 	app.update_user_login_attempts(user.id, 0)!
-	expire_date := time.now().add_days(200)
+	expire_date := time.now().add_seconds(session_ttl)
 	// HttpOnly keeps the session token out of reach of JavaScript (so an XSS
 	// payload can't steal it); SameSite=Lax stops the cookie from riding along
 	// on cross-site requests, mitigating CSRF. Set `secure: true` as well when
@@ -488,14 +497,15 @@ pub fn (mut app App) auth_user(mut ctx Context, user User, ip string) ! {
 		path:      '/'
 		http_only: true
 		same_site: .same_site_lax_mode
+		secure:    app.config.cookie_secure
 	)
 }
 
 pub fn (mut app App) is_logged_in(mut ctx Context) bool {
 	token_cookie := ctx.get_cookie('token') or { return false }
 	token := app.get_token(token_cookie) or { return false }
-	is_user_blocked := app.check_user_blocked(token.user_id)
-	if is_user_blocked {
+	user := app.get_user_by_id(token.user_id) or { return false }
+	if user.is_blocked || !user.is_registered {
 		app.handle_logout(mut ctx)
 		return false
 	}

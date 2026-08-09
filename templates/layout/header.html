@@ -48,7 +48,9 @@
 					<a href='/@ctx.user.username'>@ctx.user.username</a>
 				}
 				.links {
-					<a href='/logout' class="link">%header_sign_out</a>
+					<form action='/logout' method='post'>
+						<button type='submit' class='link link-button'>%header_sign_out</button>
+					</form>
 				}
 				<div class="dropdown-hoverzone"></div>
 			}

@@ -34,7 +34,8 @@ pub fn (mut app App) handle_create_webhook(mut ctx Context, username string, rep
 	secret := ctx.form['secret']
 	// Reject empty URLs, non-http(s) schemes, and destinations that resolve to
 	// internal/loopback/link-local addresses (SSRF protection).
-	if validation.is_string_empty(url) || !is_safe_webhook_url(url) {
+	if validation.is_string_empty(url) || url.len > max_clone_url_len
+		|| secret.len > max_webhook_secret_len || !is_safe_webhook_url(url) {
 		return ctx.redirect('/${username}/${repo_name}/settings/webhooks/new')
 	}
 	mut events := []string{}

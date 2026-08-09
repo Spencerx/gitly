@@ -5,21 +5,34 @@ import git
 
 struct Branch {
 mut:
-	id      int    @[primary; sql: serial]
-	repo_id int    @[unique: 'branch']
-	name    string @[unique: 'branch']
-	author  string // author of latest commit on branch
-	hash    string // hash of latest commit on branch
-	date    int    // time of latest commit on branch
+	id           int    @[primary; sql: serial]
+	repo_id      int    @[unique: 'branch']
+	name         string @[unique: 'branch']
+	author       string // author of latest commit on branch
+	hash         string // hash of latest commit on branch
+	date         int    // time of latest commit on branch
+	is_protected bool @[skip]
 }
 
 fn (mut app App) fetch_branches(repo Repo) ! {
-	branches_output := repo.git('branch -a')
-
-	for branch_output in branches_output.split_into_lines() {
-		branch_name := git.parse_git_branch_output(branch_output)
-
+	result := git.Git.exec_in_dir(repo.git_dir, ['for-each-ref', '--format=%(refname:short)',
+		'refs/heads'])
+	if result.exit_code != 0 {
+		return error('could not list repository branches')
+	}
+	mut present := map[string]bool{}
+	for line in result.output.split_into_lines() {
+		branch_name := line.trim_space()
+		if branch_name == '' || !is_safe_ref(branch_name) {
+			continue
+		}
+		present[branch_name] = true
 		app.fetch_branch(repo, branch_name)!
+	}
+	for existing in app.get_all_repo_branches(repo.id) {
+		if existing.name !in present {
+			app.delete_repo_branch_by_name(repo.id, existing.name)!
+		}
 	}
 }
 
@@ -129,6 +142,27 @@ fn (mut app App) contains_repo_branch(repo_id int, name string) bool {
 fn (mut app App) delete_repo_branches(repo_id int) ! {
 	sql app.db {
 		delete from Branch where repo_id == repo_id
+	}!
+}
+
+fn (mut app App) delete_repo_branch_by_name(repo_id int, branch_name string) ! {
+	branch := app.find_repo_branch_by_name(repo_id, branch_name)
+	if branch.id == 0 {
+		return
+	}
+	branch_id := branch.id
+	sql app.db {
+		delete from BranchCommit where branch_id == branch_id
+	}!
+	sql app.db {
+		delete from Branch where id == branch_id && repo_id == repo_id
+	}!
+}
+
+fn (mut app App) sync_repo_branch_count(repo_id int) ! {
+	count := app.get_count_repo_branches(repo_id)
+	sql app.db {
+		update Repo set nr_branches = count where id == repo_id
 	}!
 }
 

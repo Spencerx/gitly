@@ -18,14 +18,14 @@ pub fn (mut app App) releases(mut ctx Context, username string, repo_name string
 		return ctx.not_found()
 	}
 
-	page_i := page.int()
 	repo_id := repo.id
 	mut releases := []Release{}
 	mut release := Release{}
 
 	release_count := app.get_repo_release_count(repo_id)
-	offset := releases_per_page * page_i
 	page_count := calculate_pages(release_count, releases_per_page)
+	page_i := normalize_page(page, page_count)
+	offset := releases_per_page * page_i
 	is_first_page := check_first_page(page_i)
 	is_last_page := check_last_page(release_count, offset, releases_per_page)
 	prev_page, next_page := generate_prev_next_pages(page_i)

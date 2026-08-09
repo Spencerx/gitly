@@ -20,7 +20,24 @@
 
 		<div class="content">
 			<div class="repo-header-area">
-				@include 'layout/repo_menu.html'
+			@include 'layout/repo_menu.html'
+			@if is_top_directory
+				<div class="fork-summary">
+					@if upstream_repo.id > 0
+						<span>Forked from <a href="/@upstream_repo.user_name/@upstream_repo.name">@upstream_repo.user_name/@upstream_repo.name</a></span>
+						<a href="/@upstream_repo.user_name/@upstream_repo.name/compare?head_repo=@repo.id&head=@branch_name">Contribute upstream</a>
+						@if app.can_admin_repo(ctx, repo)
+							<form action="/@repo.user_name/@repo.name/fork/sync" method="post">
+								<button type="submit">Sync fork</button>
+							</form>
+						@end
+					@end
+					<a href="/@repo.user_name/@repo.name/forks">@{forks_count} forks</a>
+					@if ctx.logged_in
+						<a href="/@repo.user_name/@repo.name/fork">Fork</a>
+					@end
+				</div>
+			@end
 
 				@if is_top_directory
 					<div class="repo-actions">
@@ -79,7 +96,7 @@
 					</div>
 
 					<div class="branch-right-actions">
-						@if repo.user_id == ctx.user.id
+						@if ctx.logged_in && app.user_can_push_branch(ctx.user.id, repo, branch_name)
 							<a class="add-file-btn" href="/@repo.user_name/@repo.name/new/@branch_name">+</a>
 						@end
 
@@ -92,6 +109,13 @@
 									<input disabled value="@{app.generate_clone_url(repo)}">
 									<button class="copy-clone-url-button">Copy</button>
 								</div>
+								@if app.config.ssh_enabled
+									Clone with SSH:
+									<div class="clone-input-group">
+										<input disabled value="@{app.generate_ssh_clone_url(repo)}">
+										<button class="copy-clone-url-button">Copy</button>
+									</div>
+								@end
 							</div>
 						</div>
 					</div>

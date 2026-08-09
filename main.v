@@ -36,10 +36,17 @@ fn get_port(conf config.Config) int {
 }
 
 fn main() {
+	if os.args.len >= 5 && os.args[1] == 'ssh-shell' {
+		exit(run_ssh_shell(os.args[2], os.args[3].int(), os.args[4]))
+	}
+	if os.args.len >= 4 && os.args[1] == 'ssh-post-receive' {
+		exit(run_ssh_post_receive(os.args[2].int(), os.args[3]))
+	}
 	if os.args.contains('ci_run') {
 		return
 	}
 	mut app := new_app()!
+	spawn run_mirror_scheduler(app.config)
 
 	app.use(handler: app.before_request)
 	app.route_use('/:username/:repo_name/pull/:id/files', handler: minify_pr_files_html, after: true)

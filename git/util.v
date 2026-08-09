@@ -3,24 +3,124 @@ module git
 import strings
 import net.http
 import os
+import time
+import strconv
+
+pub struct GitRefUpdate {
+pub:
+	old_hash string
+	new_hash string
+	ref_name string
+}
+
+pub fn (update GitRefUpdate) branch_name() ?string {
+	if !update.ref_name.starts_with('refs/heads/') {
+		return none
+	}
+	name := update.ref_name['refs/heads/'.len..]
+	if name == '' {
+		return none
+	}
+	return name
+}
+
+pub fn (update GitRefUpdate) is_delete() bool {
+	if update.new_hash == '' {
+		return false
+	}
+	for ch in update.new_hash {
+		if ch != `0` {
+			return false
+		}
+	}
+	return true
+}
+
+fn valid_object_id(value string) bool {
+	if value.len !in [40, 64] {
+		return false
+	}
+	for ch in value {
+		if !(ch >= `0` && ch <= `9`) && !(ch >= `a` && ch <= `f`) {
+			return false
+		}
+	}
+	return true
+}
+
+// parse_receive_updates reads only the pkt-line command section before the
+// packfile. Parsing every command is security-sensitive: checking only the
+// first ref lets a multi-ref push smuggle an update to a protected branch.
+pub fn parse_receive_updates(upload string) ![]GitRefUpdate {
+	mut updates := []GitRefUpdate{}
+	mut offset := 0
+	for offset + 4 <= upload.len {
+		prefix := upload[offset..offset + 4]
+		packet_len := int(strconv.parse_uint(prefix, 16, 16) or {
+			return error('invalid pkt-line length')
+		})
+		if packet_len == 0 {
+			break
+		}
+		if packet_len < 4 || offset + packet_len > upload.len {
+			return error('truncated pkt-line')
+		}
+		mut command := upload[offset + 4..offset + packet_len]
+		nul := command.index_u8(0)
+		if nul >= 0 {
+			command = command[..nul]
+		}
+		command = command.trim_space()
+		parts := command.fields()
+		if parts.len < 3 || !valid_object_id(parts[0]) || !valid_object_id(parts[1])
+			|| !parts[2].starts_with('refs/') || parts[2].contains_any('\x00\r\n ') {
+			return error('invalid receive command')
+		}
+		updates << GitRefUpdate{
+			old_hash: parts[0]
+			new_hash: parts[1]
+			ref_name: parts[2]
+		}
+		offset += packet_len
+	}
+	if updates.len == 0 {
+		return error('no receive commands')
+	}
+	return updates
+}
+
+pub fn receive_updates_accepted(response string) bool {
+	return response != '' && response.contains('unpack ok') && !response.contains('ng refs/')
+}
+
+pub fn parse_post_receive_updates(lines []string) ![]GitRefUpdate {
+	mut updates := []GitRefUpdate{}
+	for line in lines {
+		parts := line.trim_space().fields()
+		if parts.len != 3 || !valid_object_id(parts[0]) || !valid_object_id(parts[1])
+			|| !parts[2].starts_with('refs/') || parts[2].contains_any('\x00\r\n ') {
+			return error('invalid post-receive command')
+		}
+		updates << GitRefUpdate{
+			old_hash: parts[0]
+			new_hash: parts[1]
+			ref_name: parts[2]
+		}
+	}
+	if updates.len == 0 {
+		return error('no post-receive commands')
+	}
+	return updates
+}
 
 pub fn parse_branch_name_from_receive_upload(upload string) ?string {
-	upload_lines := upload.split_into_lines()
-	if upload_lines.len == 0 {
-		return none
+	updates := parse_receive_updates(upload) or { return none }
+	for update in updates {
+		if branch := update.branch_name() {
+			return branch
+		}
 	}
-	upload_header := upload_lines[0]
-	header_parts := upload_header.fields()
-	if header_parts.len < 3 {
-		return none
-	}
-	branch_reference := header_parts[2]
-	branch_name_raw := get_branch_name_from_reference(branch_reference)
-	branch_name := branch_name_raw.trim_space().trim('\0')
-	if branch_name.len == 0 {
-		return none
-	}
-	return branch_name
+	return none
 }
 
 // parse_git_branch_with_last_hash parses output from `git branch -a`
@@ -50,12 +150,15 @@ pub fn check_git_repo_url(url string) bool {
 	headers.add_custom('User-Agent', 'git/2.30.0') or {}
 	headers.add_custom('Git-Protocol', 'version=2') or {}
 	config := http.FetchConfig{
-		url:    refs_url
-		header: headers
+		url:                  refs_url
+		header:               headers
+		read_timeout:         10 * time.second
+		write_timeout:        10 * time.second
+		allow_redirect:       false
+		max_retries:          1
+		stop_receiving_limit: 1024 * 1024
 	}
-	println('URL=$refs_url $config')
 	response := http.fetch(config) or { return false }
-	println('response=$response')
 	if response.status_code != 200 {
 		return false
 	}

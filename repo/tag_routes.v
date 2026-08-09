@@ -5,17 +5,19 @@ import os
 
 @['/:username/:repo_name/tag/:tag/:format']
 pub fn (mut app App) handle_download_tag_archive(username string, repo_name string, tag string, format string) veb.Result {
-	// access checking will be implemented in another module
-	user := app.get_user_by_username(username) or { return ctx.not_found() }
-	repo := app.find_repo_by_name_and_user_id(repo_name, user.id) or { return ctx.not_found() }
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
 	if !app.can_read_repo(ctx, repo) {
 		return ctx.not_found()
 	}
+	if !is_safe_ref(tag) || format !in ['zip', 'tar.gz'] {
+		return ctx.not_found()
+	}
 
 	archive_abs_path := os.abs_path(app.config.archive_path)
-	snapshot_format := if format == 'zip' { 'zip' } else { 'tar.gz' }
-	snapshot_name := '${username}_${repo_name}_${tag}.${snapshot_format}'
+	snapshot_format := format
+	safe_tag_name := tag.replace('/', '-')
+	snapshot_name := '${username}_${repo_name}_${safe_tag_name}.${snapshot_format}'
 	archive_path := '${archive_abs_path}/${snapshot_name}'
 
 	if format == 'zip' {

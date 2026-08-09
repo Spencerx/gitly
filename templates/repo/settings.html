@@ -18,7 +18,7 @@
 			<section class="settings-section">
 				<h2 class="settings-section__title">%features_section_title</h2>
 				<p class="settings-section__desc">%features_section_desc</p>
-				<form class="settings-form features-form" action="/@ctx.user.username/@repo.name/settings/features" method="post">
+				<form class="settings-form features-form" action="/@repo.user_name/@repo.name/settings/features" method="post">
 					<label class="features-form__option">
 						<input type="checkbox" name="discussions_enabled"
 						@if repo.discussions_enabled()
@@ -43,22 +43,30 @@
 						>
 						<span>%milestones</span>
 					</label>
-					<label class="features-form__option">
-						<input type="checkbox" name="wiki_enabled"
-						@if repo.wiki_enabled()
-							checked
-						@end
-						>
-						<span>%wiki</span>
-					</label>
 					<input type="submit" class="settings-form__submit" value="%save_features">
+				</form>
+			</section>
+
+			<section class="settings-section">
+				<h2 class="settings-section__title">Project governance</h2>
+				<p class="settings-section__desc">Manage role-based membership, protected branches, and merge approval requirements.</p>
+				<div class="settings-link-grid">
+					<a href="/@repo.user_name/@repo.name/settings/members"><strong>Members</strong><span>Reporter, Developer, and Maintainer access</span></a>
+					<a href="/@repo.user_name/@repo.name/settings/branches"><strong>Protected branches</strong><span>Control who can push and merge</span></a>
+					<a href="/@repo.user_name/@repo.name/settings/deploy-keys"><strong>Deploy keys</strong><span>Grant read-only or write SSH access</span></a>
+					<a href="/@repo.user_name/@repo.name/settings/mirrors"><strong>Repository mirrors</strong><span>Pull from or push to another Git server</span></a>
+				</div>
+				<form class="settings-form approvals-form" action="/@repo.user_name/@repo.name/settings/approvals" method="post">
+					<label for="required-approvals">Required approvals per merge request</label>
+					<input id="required-approvals" type="number" name="required_approvals" min="0" max="100" value="@repo.required_approvals" required>
+					<button class="settings-form__submit" type="submit">Save approval rule</button>
 				</form>
 			</section>
 
 			<section class="settings-section">
 				<h2 class="settings-section__title">%webhooks</h2>
 				<p class="settings-section__desc">%webhook_secret_hint</p>
-				<a class="settings-form__submit settings-form__submit--link" href="/@ctx.user.username/@repo.name/settings/webhooks">%manage_webhooks</a>
+				<a class="settings-form__submit settings-form__submit--link" href="/@repo.user_name/@repo.name/settings/webhooks">%manage_webhooks</a>
 			</section>
 
 			<section class="settings-section settings-section--danger">
@@ -69,9 +77,9 @@
 						<h3 class="danger-action__title">%transfer_ownership</h3>
 						<p class="danger-action__desc">%transfer_ownership_desc</p>
 					</div>
-					<form class="settings-form danger-action__form" action="/@ctx.user.username/@repo.name/move" method="post">
+					<form class="settings-form danger-action__form" action="/@repo.user_name/@repo.name/move" method="post">
 						<input type="text" name="dest" placeholder="%new_owner_username" required>
-						<input type="text" name="verify" placeholder="@ctx.user.username/@repo.name" required>
+						<input type="text" name="verify" placeholder="@repo.user_name/@repo.name" required>
 						<input type="submit" class="settings-form__submit settings-form__submit--danger" value="%move_repo">
 					</form>
 				</div>
@@ -81,8 +89,8 @@
 						<h3 class="danger-action__title">%delete_repo_title</h3>
 						<p class="danger-action__desc">%delete_repo_desc</p>
 					</div>
-					<form id="delete-repo-form" class="settings-form danger-action__form" action="/@ctx.user.username/@repo.name/delete" method="post" data-expected-path="@ctx.user.username/@repo.name">
-						<input id="delete-repo-verify" type="text" name="verify" placeholder="@ctx.user.username/@repo.name" autocomplete="off" required>
+					<form id="delete-repo-form" class="settings-form danger-action__form" action="/@repo.user_name/@repo.name/delete" method="post" data-expected-path="@repo.user_name/@repo.name">
+						<input id="delete-repo-verify" type="text" name="verify" placeholder="@repo.user_name/@repo.name" autocomplete="off" required>
 						<input id="delete-repo-submit" type="submit" class="settings-form__submit settings-form__submit--danger" value="%delete_repo" disabled>
 					</form>
 				</div>

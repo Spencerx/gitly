@@ -29,7 +29,25 @@ fn extract_file_extension_from_mime_type(mime_type string) !string {
 }
 
 fn validate_avatar_file_size(content string) bool {
-	return content.len <= avatar_max_file_size
+	return content.len > 0 && content.len <= avatar_max_file_size
+}
+
+fn validate_avatar_content(content_type string, content string) bool {
+	bytes := content.bytes()
+	return match content_type {
+		'image/png' {
+			bytes.len >= 8 && bytes[..8] == [u8(0x89), `P`, `N`, `G`, `\r`, `\n`, u8(0x1a), `\n`]
+		}
+		'image/jpeg' {
+			bytes.len >= 3 && bytes[0] == 0xff && bytes[1] == 0xd8 && bytes[2] == 0xff
+		}
+		'image/webp' {
+			bytes.len >= 12 && bytes[..4].bytestr() == 'RIFF' && bytes[8..12].bytestr() == 'WEBP'
+		}
+		else {
+			false
+		}
+	}
 }
 
 fn (app App) build_avatar_file_path(avatar_filename string) string {
@@ -39,8 +57,7 @@ fn (app App) build_avatar_file_path(avatar_filename string) string {
 }
 
 fn (app App) build_avatar_file_url(avatar_filename string) string {
-	clean_path := app.config.avatars_path.trim_string_left('./')
-	return os.join_path('/', clean_path, avatar_filename)
+	return os.join_path('/avatars', avatar_filename)
 }
 
 fn (app App) write_user_avatar(avatar_filename string, file_content string) bool {

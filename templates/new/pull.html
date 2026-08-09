@@ -21,6 +21,7 @@
 			@end
 
 			<form method='get' class='pr-compare-form' action='/@repo.user_name/@repo.name/compare'>
+				<input type='hidden' name='head_repo' value='@head_repo_id'>
 				<label class='pr-compare-label'>
 					%pr_base
 					<select name='base'>
@@ -36,9 +37,10 @@
 				<span class='pr-compare-arrow'>&larr;</span>
 				<label class='pr-compare-label'>
 					%pr_compare
+					<span>@head_repo.user_name/@head_repo.name</span>
 					<select name='head'>
 						<option value=''>%pr_choose_branch</option>
-						@for branch in branches
+						@for branch in head_branches
 							@if branch.name == head
 								<option value='@branch.name' selected>@branch.name</option>
 							@else
@@ -61,6 +63,7 @@
 
 					<form method='post' class='pr-new-form' action='/@repo.user_name/@repo.name/pulls'>
 						<input type='hidden' name='head' value='@head'>
+						<input type='hidden' name='head_repo_id' value='@head_repo_id'>
 						<input type='hidden' name='base' value='@base'>
 						<div class="field">
 							<input type='text' name='title' placeholder='%pr_title_placeholder' value='@suggested_title' required>

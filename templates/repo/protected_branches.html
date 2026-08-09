@@ -1,0 +1,101 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include '../layout/head.html'
+	</head>
+	<body>
+		@include '../layout/header.html'
+		<div class="content">
+			@include '../layout/repo_menu.html'
+			<div class="settings-breadcrumb"><a href="/@repo.user_name/@repo.name/settings">Settings</a> / Protected branches</div>
+			<h1 class="settings-title">Protected branches</h1>
+			@if ctx.form_error != ''
+				<div class="form-error">@ctx.form_error</div>
+			@end
+			<section class="settings-section">
+				<h2 class="settings-section__title">Protect a branch</h2>
+				<p class="settings-section__desc">Use an exact branch name or a wildcard such as <code>release/*</code>. Protected branches cannot be deleted through Git.</p>
+				<form class="settings-form governance-form" method="post" action="/@repo.user_name/@repo.name/settings/branches">
+					<input name="pattern" list="repo-branches" placeholder="Branch or wildcard" required>
+					<datalist id="repo-branches">
+						@for branch in branches
+							<option value="@branch.name"></option>
+						@end
+					</datalist>
+					<label>Allowed to push
+						<select name="push_access">
+							<option value="100">No one</option>
+							<option value="40" selected>Maintainers</option>
+							<option value="30">Developers and Maintainers</option>
+						</select>
+					</label>
+					<label>Allowed to merge
+						<select name="merge_access">
+							<option value="100">No one</option>
+							<option value="40" selected>Maintainers</option>
+							<option value="30">Developers and Maintainers</option>
+						</select>
+					</label>
+					<button type="submit">Protect</button>
+				</form>
+			</section>
+			<section class="settings-section">
+				<h2 class="settings-section__title">Rules</h2>
+				@if rules.len == 0
+					<p class="settings-empty">No protected branch rules.</p>
+				@else
+					<div class="governance-list">
+						@for rule in rules
+							<div class="governance-row governance-row--branch">
+								<div class="governance-row__identity"><code>@rule.pattern</code></div>
+								<form class="settings-form governance-row__actions" method="post" action="/@repo.user_name/@repo.name/settings/branches/@rule.id">
+									<label>Push
+										<select name="push_access">
+											@if rule.push_access == 100
+												<option value="100" selected>No one</option>
+											@else
+												<option value="100">No one</option>
+											@end
+											@if rule.push_access == 40
+												<option value="40" selected>Maintainers</option>
+											@else
+												<option value="40">Maintainers</option>
+											@end
+											@if rule.push_access == 30
+												<option value="30" selected>Developers</option>
+											@else
+												<option value="30">Developers</option>
+											@end
+										</select>
+									</label>
+									<label>Merge
+										<select name="merge_access">
+											@if rule.merge_access == 100
+												<option value="100" selected>No one</option>
+											@else
+												<option value="100">No one</option>
+											@end
+											@if rule.merge_access == 40
+												<option value="40" selected>Maintainers</option>
+											@else
+												<option value="40">Maintainers</option>
+											@end
+											@if rule.merge_access == 30
+												<option value="30" selected>Developers</option>
+											@else
+												<option value="30">Developers</option>
+											@end
+										</select>
+									</label>
+									<button type="submit">Update</button>
+								</form>
+								<form method="post" action="/@repo.user_name/@repo.name/settings/branches/@rule.id/delete"><button class="danger-link-button" type="submit">Unprotect</button></form>
+							</div>
+						@end
+					</div>
+				@end
+			</section>
+		</div>
+		@include '../layout/footer.html'
+	</body>
+</html>

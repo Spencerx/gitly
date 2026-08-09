@@ -152,5 +152,17 @@ fn (mut app App) delete_repo_folder(path string) {
 	if path == '' {
 		return
 	}
-	os.rmdir_all(os.real_path(path)) or { app.warn('failed to remove repo folder ${path}: ${err}') }
+	storage_root := os.real_path(app.config.repo_storage_path).trim_right(os.path_separator)
+	target := os.real_path(path).trim_right(os.path_separator)
+	prefix := storage_root + os.path_separator
+	if target == storage_root || !target.starts_with(prefix) {
+		app.warn('refusing to remove repository path outside storage root: ${path}')
+		return
+	}
+	relative := target[prefix.len..]
+	if relative.split(os.path_separator).len < 2 {
+		app.warn('refusing to remove repository owner directory: ${path}')
+		return
+	}
+	os.rmdir_all(target) or { app.warn('failed to remove repo folder ${path}: ${err}') }
 }

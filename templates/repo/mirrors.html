@@ -1,0 +1,46 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include '../layout/head.html'
+	</head>
+	<body>
+		@include '../layout/header.html'
+		<div class="content">
+			@include '../layout/repo_menu.html'
+			<h1>Repository mirrors</h1>
+			<p>Pull mirrors import branches from an external repository. Push mirrors replicate local branches to an external repository. Credentials are encrypted at rest and never displayed again.</p>
+			@if ctx.form_error != ''
+				<div class="form-error">@ctx.form_error</div>
+			@end
+			<form class="form settings-form" action="/@repo.user_name/@repo.name/settings/mirrors" method="post">
+				<div class="field"><label for="mirror-url">HTTPS or SSH repository URL</label><input id="mirror-url" name="url" type="text" placeholder="https://git.example.com/group/project.git or ssh://git&#64;git.example.com/group/project.git" required></div>
+				<div class="field"><label for="mirror-username">Username (optional)</label><input id="mirror-username" name="mirror_username" autocomplete="off"></div>
+				<div class="field"><label for="mirror-password">Password or access token (optional)</label><input id="mirror-password" name="mirror_password" type="password" autocomplete="new-password"></div>
+				<div class="field"><label for="ssh-key">SSH private key (SSH mirrors only)</label><textarea id="ssh-key" name="ssh_private_key" autocomplete="off"></textarea></div>
+				<div class="field"><label for="known-hosts">Pinned known_hosts entry (required for SSH)</label><textarea id="known-hosts" name="ssh_known_hosts" placeholder="git.example.com ssh-ed25519 AAAA..."></textarea></div>
+				<div class="field"><label for="direction">Direction</label><select id="direction" name="direction"><option value="pull">Pull</option><option value="push">Push</option></select></div>
+				<div class="field"><label for="interval">Update interval in minutes</label><input id="interval" name="interval_minutes" type="number" min="5" max="1440" value="5" required></div>
+				<div class="field"><label><input type="checkbox" name="only_protected"> Mirror only protected branches</label></div>
+				<div class="field"><label><input type="checkbox" name="overwrite_diverged"> Overwrite diverged branches</label></div>
+				<button type="submit">Add mirror</button>
+			</form>
+			@if mirrors.len == 0
+				<p>No mirrors are configured.</p>
+			@else
+				@for mirror in mirrors
+					<div class="settings-section">
+						<h3>@mirror.direction mirror</h3>
+						<p><code>@mirror.url</code></p>
+						<p>Last update: @{mirror.last_update_description()} · Every @mirror.interval_minutes minutes</p>
+						@if mirror.last_error != ''
+							<div class="form-error">@mirror.last_error</div>
+						@end
+						<form action="/@repo.user_name/@repo.name/settings/mirrors/@mirror.id/sync" method="post"><button type="submit">Update now</button></form>
+						<form action="/@repo.user_name/@repo.name/settings/mirrors/@mirror.id/delete" method="post"><button type="submit">Remove</button></form>
+					</div>
+				@end
+			@end
+		</div>
+		@include '../layout/footer.html'
+	</body>
+</html>

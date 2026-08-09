@@ -3,7 +3,6 @@ module main
 import time
 import math
 import os
-import veb
 
 pub fn (mut app App) running_since() string {
 	duration := time.now().unix() - app.started_at
@@ -42,6 +41,17 @@ fn calculate_pages(count int, per_page int) int {
 	return int(math.ceil(f32(count) / f32(per_page))) - 1
 }
 
+fn normalize_page(page string, page_count int) int {
+	parsed := page.int()
+	if parsed < 0 {
+		return 0
+	}
+	if parsed > page_count {
+		return page_count
+	}
+	return parsed
+}
+
 fn generate_prev_next_pages(page int) (int, int) {
 	prev_page := if page > 0 { page - 1 } else { 0 }
 	next_page := page + 1
@@ -55,16 +65,6 @@ fn check_first_page(page int) bool {
 
 fn check_last_page(total int, offset int, per_page int) bool {
 	return (total - offset) < per_page
-}
-
-const is_dev = true
-
-fn css2(s string) veb.RawHtml {
-	if is_dev {
-		return '<link href="http://localhost:8000/${s}" rel="stylesheet" type="text/css">'
-	} else {
-		return '<link href="/static/${s}" rel="stylesheet" type="text/css">'
-	}
 }
 
 fn minify_pr_files_html(mut ctx Context) bool {

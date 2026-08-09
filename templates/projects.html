@@ -11,7 +11,7 @@
 
 			<div class="issues-header">
 				<h1 class="issues-header__title">%projects</h1>
-				@if ctx.logged_in && repo.user_id == ctx.user.id
+				@if app.can_admin_repo(ctx, repo)
 					<a class="issues-header__new" href="/@repo.user_name/@repo.name/projects/new">%project_new</a>
 				@end
 			</div>

@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include '../layout/head.html'
+	</head>
+	<body>
+		@include '../layout/header.html'
+
+		<div class="content">
+			<h1>Repository transfers</h1>
+			@if ctx.form_error != ''
+				<div class="form-error">@ctx.form_error</div>
+			@end
+			@if transfers.len == 0
+				<p>No pending repository transfers.</p>
+			@else
+				@for item in transfers
+					<div class="activity">
+						<p><b>@item.repo.user_name/@item.repo.name</b> was offered by <a href="/@item.from.username">@item.from.username</a>.</p>
+						<form method="post" action="/@username/settings/repo-transfers/@{item.transfer.id}/accept">
+							<button type="submit">Accept</button>
+						</form>
+						<form method="post" action="/@username/settings/repo-transfers/@{item.transfer.id}/decline">
+							<button type="submit">Decline</button>
+						</form>
+					</div>
+				@end
+			@end
+		</div>
+
+		@include '../layout/footer.html'
+	</body>
+</html>

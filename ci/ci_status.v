@@ -8,6 +8,7 @@ enum CiStatusEnum {
 	success   = 2
 	failure   = 3
 	cancelled = 4
+	timed_out = 5
 }
 
 fn (s CiStatusEnum) str() string {
@@ -17,6 +18,7 @@ fn (s CiStatusEnum) str() string {
 		.success { 'success' }
 		.failure { 'failure' }
 		.cancelled { 'cancelled' }
+		.timed_out { 'timed_out' }
 	}
 }
 
@@ -27,6 +29,7 @@ fn (s CiStatusEnum) css_class() string {
 		.success { 'ci-success' }
 		.failure { 'ci-failure' }
 		.cancelled { 'ci-cancelled' }
+		.timed_out { 'ci-failure' }
 	}
 }
 
@@ -37,6 +40,7 @@ fn (s CiStatusEnum) icon() string {
 		.success { '✓' }
 		.failure { '✗' }
 		.cancelled { '⊘' }
+		.timed_out { '⌛' }
 	}
 }
 
@@ -58,6 +62,7 @@ fn ci_status_from_string(s string) CiStatusEnum {
 		'success' { CiStatusEnum.success }
 		'failure' { CiStatusEnum.failure }
 		'cancelled' { CiStatusEnum.cancelled }
+		'timed_out' { CiStatusEnum.timed_out }
 		else { CiStatusEnum.pending }
 	}
 }
@@ -86,6 +91,16 @@ fn (mut app App) find_ci_runs_for_repo(repo_id int) []CiStatus {
 	return sql app.db {
 		select from CiStatus where repo_id == repo_id order by id desc
 	} or { []CiStatus{} }
+}
+
+fn (mut app App) repo_owns_ci_run(repo_id int, ci_run_id int) bool {
+	if ci_run_id <= 0 {
+		return false
+	}
+	count := sql app.db {
+		select count from CiStatus where repo_id == repo_id && ci_run_id == ci_run_id
+	} or { 0 }
+	return count > 0
 }
 
 fn (mut app App) add_ci_status(ci CiStatus) ! {

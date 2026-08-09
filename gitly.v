@@ -11,14 +11,39 @@ import config
 import git
 
 const commits_per_page = 35
-const expire_length = 200
 const posts_per_day = 5
 const max_username_len = 40
+const max_password_len = 128
 const max_login_attempts = 5
 const max_user_repos = 10
 const max_repo_name_len = 100
+const max_repo_description_len = 500
+const max_clone_url_len = 2048
+const max_title_len = 300
+const max_short_name_len = 100
+const max_body_len = 100_000
+const max_comment_len = 50_000
+const max_file_edit_size = 2 * 1024 * 1024
+const max_commit_message_len = 500
+const max_webhook_secret_len = 1024
 const max_namechanges = 3
 const namechange_period = time.hour * 24
+
+fn valid_title(value string) bool {
+	return value.trim_space() != '' && value.len <= max_title_len
+}
+
+fn valid_short_name(value string) bool {
+	return value.trim_space() != '' && value.len <= max_short_name_len
+}
+
+fn valid_body(value string) bool {
+	return value.len <= max_body_len
+}
+
+fn valid_comment(value string) bool {
+	return value.trim_space() != '' && value.len <= max_comment_len
+}
 
 @[heap]
 pub struct App {
@@ -85,18 +110,15 @@ fn new_app() !&App {
 	build_unix := os.file_last_mod_unix(os.executable())
 	app.build_time = time.unix(build_unix).format()
 
-	app.handle_static('static', true)!
-	app.serve_static('/favicon.ico', 'static/assets/favicon.svg')!
-	if !os.exists('avatars') {
-		os.mkdir('avatars')!
-	}
-	app.handle_static('avatars', false)!
-
-	app.load_settings()
-
 	create_directory_if_not_exists(app.config.repo_storage_path)
 	create_directory_if_not_exists(app.config.archive_path)
 	create_directory_if_not_exists(app.config.avatars_path)
+
+	app.handle_static('static', true)!
+	app.serve_static('/favicon.ico', 'static/assets/favicon.svg')!
+	app.mount_static_folder_at(app.config.avatars_path, '/avatars')!
+
+	app.load_settings()
 
 	// Create the first admin user if the db is empty
 	app.get_user_by_id(1) or {}
@@ -139,6 +161,15 @@ pub fn (mut app App) init_server() {
 pub fn (mut app App) before_request(mut ctx Context) bool {
 	ctx.page_gen_start = time.ticks()
 	ctx.set_page_title_from_path(ctx.req.url)
+	ctx.set_custom_header('X-Content-Type-Options', 'nosniff') or {}
+	ctx.set_custom_header('X-Frame-Options', 'DENY') or {}
+	ctx.set_custom_header('Referrer-Policy', 'strict-origin-when-cross-origin') or {}
+	ctx.set_custom_header('Permissions-Policy', 'camera=(), microphone=(), geolocation=()') or {}
+	if !request_source_is_same_origin(ctx) {
+		ctx.res.set_status(.forbidden)
+		ctx.text('Forbidden: cross-site state-changing request')
+		return false
+	}
 	$if trace_prealloc ? {
 		unsafe { prealloc_scope_checkpoint(c'gitly before_request start') }
 	}
@@ -169,6 +200,54 @@ pub fn (mut app App) before_request(mut ctx Context) bool {
 		unsafe { prealloc_scope_checkpoint(c'gitly loaded lang') }
 	}
 	return true
+}
+
+// Browsers attach Origin and/or Referer to state-changing form/fetch requests.
+// Reject an explicitly cross-site source before dispatching the route. Requests
+// from non-browser clients commonly omit both headers and remain supported;
+// bearer/HMAC authentication continues to protect those endpoints.
+fn request_source_is_same_origin(ctx &Context) bool {
+	if ctx.req.method !in [.post, .put, .patch, .delete] {
+		return true
+	}
+	host := ctx.get_header(.host) or { return false }
+	origin := ctx.get_header(.origin) or { '' }
+	referer := ctx.get_header(.referer) or { '' }
+	if origin == '' && referer == '' {
+		return true
+	}
+	if origin != '' && !url_source_matches_host(origin, host) {
+		return false
+	}
+	if referer != '' && !url_source_matches_host(referer, host) {
+		return false
+	}
+	return true
+}
+
+fn url_source_matches_host(source string, request_host string) bool {
+	value := source.trim_space().to_lower()
+	if value == '' || value == 'null' {
+		return false
+	}
+	for scheme in ['http://', 'https://'] {
+		if !value.starts_with(scheme) {
+			continue
+		}
+		rest := value[scheme.len..]
+		source_authority := rest.all_before('/').all_before('?').all_before('#')
+		return normalize_url_authority(source_authority, scheme) == normalize_url_authority(request_host.trim_space().to_lower(),
+			scheme)
+	}
+	return false
+}
+
+fn normalize_url_authority(authority string, scheme string) string {
+	if (scheme == 'http://' && authority.ends_with(':80'))
+		|| (scheme == 'https://' && authority.ends_with(':443')) {
+		return authority.all_before_last(':')
+	}
+	return authority
 }
 
 @['/open-source']
@@ -355,6 +434,9 @@ fn (mut app App) create_tables() ! {
 		create table SshKey
 	}!
 	sql app.db {
+		create table DeployKey
+	}!
+	sql app.db {
 		create table Comment
 	}!
 	sql app.db {
@@ -426,11 +508,30 @@ fn (mut app App) create_tables() ! {
 	sql app.db {
 		create table OrgMember
 	}!
+	sql app.db {
+		create table RepoTransfer
+	}!
+	sql app.db {
+		create table RepoFork
+	}!
+	sql app.db {
+		create table RepoMirror
+	}!
+	sql app.db {
+		create table ProjectMember
+	}!
+	sql app.db {
+		create table ProtectedBranch
+	}!
+	sql app.db {
+		create table PrApproval
+	}!
 }
 
 fn (mut app App) migrate_tables() ! {
 	app.add_missing_column('File', 'is_size_calculated', db_bool_column_type())!
 	app.add_missing_column('Settings', 'disable_tree_folder_size', db_bool_column_type())!
+	app.add_missing_column('Settings', 'governance_backfilled', db_bool_column_type())!
 	app.add_missing_column('Repo', 'is_deleted', db_bool_column_type())!
 	app.add_missing_column('Repo', 'disable_discussions', db_bool_column_type())!
 	app.add_missing_column('Repo', 'disable_projects', db_bool_column_type())!
@@ -438,11 +539,49 @@ fn (mut app App) migrate_tables() ! {
 	app.add_missing_column('Repo', 'disable_wiki', db_bool_column_type())!
 	app.add_missing_column('Repo', 'is_pinned', db_bool_column_type())!
 	app.add_missing_column('Repo', 'created_at', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('Repo', 'required_approvals', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('SshKey', 'fingerprint', "TEXT NOT NULL DEFAULT ''")!
+	app.add_missing_column('SshKey', 'usage_type', "TEXT NOT NULL DEFAULT 'auth'")!
+	app.add_missing_column('SshKey', 'expires_at', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('SshKey', 'last_used_at', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('DeployKey', 'can_push_protected', db_bool_column_type())!
 	app.add_missing_column('PullRequest', 'merged_at', 'INTEGER NOT NULL DEFAULT 0')!
 	app.add_missing_column('PullRequest', 'merge_commit_hash', "TEXT NOT NULL DEFAULT ''")!
+	app.add_missing_column('PullRequest', 'head_repo_id', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('RepoMirror', 'encrypted_ssh_key', "TEXT NOT NULL DEFAULT ''")!
+	app.add_missing_column('RepoMirror', 'ssh_known_hosts', "TEXT NOT NULL DEFAULT ''")!
+	app.add_missing_column('Token', 'created_at', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('Token', 'expires_at', 'INTEGER NOT NULL DEFAULT 0')!
 	app.backfill_repo_created_at()!
+	app.backfill_default_branch_protection_once()!
+	app.clear_legacy_local_github_usernames()!
+	app.backfill_ssh_key_fingerprints()!
+	app.sync_authorized_keys() or { app.warn('Could not synchronize authorized_keys: ${err}') }
 
 	app.db.exec('create index if not exists idx_commit_repo_created on ${sql_table('Commit')} (repo_id, created_at desc)')!
+	app.db.exec('create unique index if not exists idx_repo_owner_name_active on ${sql_table('Repo')} (user_name, name) where is_deleted is false')!
+	app.db.exec('create index if not exists idx_repo_fork_source on ${sql_table('RepoFork')} (source_repo_id, created_at desc)')!
+	app.db.exec('create index if not exists idx_repo_mirror_due on ${sql_table('RepoMirror')} (enabled, next_update_at)')!
+}
+
+fn (mut app App) clear_legacy_local_github_usernames() ! {
+	empty := ''
+	sql app.db {
+		update User set github_username = empty where is_github == false && github_username != empty
+	}!
+	github_users := sql app.db {
+		select from User where is_github == true
+	}!
+	for github_user in github_users {
+		normalized := github_user.github_username.trim_space().to_lower()
+		if normalized == github_user.github_username {
+			continue
+		}
+		id := github_user.id
+		sql app.db {
+			update User set github_username = normalized where id == id
+		}!
+	}
 }
 
 fn (mut app App) backfill_repo_created_at() ! {

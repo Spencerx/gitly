@@ -13,12 +13,21 @@
 			<div class="ci-run-header">
 				<h1>CI Run #@{ci_run.id}</h1>
 				<span class="ci-status-badge @{ci_run.status_css_class()}">@{ci_run.status}</span>
-				@if repo.user_id == ctx.user.id
-					<form class="ci-restart-form" method="POST" action="/@repo.user_name/@repo.name/ci/@{ci_run.id}/restart">
-						<button type="submit" class="ci-restart-btn">⟳ Restart</button>
-					</form>
+				@if app.can_admin_repo(ctx, repo)
+					@if ci_run.status == 'pending' || ci_run.status == 'running'
+						<form class="ci-restart-form" method="POST" action="/@repo.user_name/@repo.name/ci/@{ci_run.id}/cancel">
+							<button type="submit" class="ci-restart-btn">⊘ Cancel</button>
+						</form>
+					@else
+						<form class="ci-restart-form" method="POST" action="/@repo.user_name/@repo.name/ci/@{ci_run.id}/restart">
+							<button type="submit" class="ci-restart-btn">⟳ Restart</button>
+						</form>
+					@end
 				@end
 			</div>
+			@if ci_run.error_message != ''
+				<div class="form-error">@ci_run.error_message</div>
+			@end
 
 			<div class="ci-run-info">
 				<span>Branch: <b>@{ci_run.branch}</b></span>
@@ -30,7 +39,10 @@
 			@for job in ci_run.jobs
 				<div class="ci-job">
 					<div class="ci-job-header @{job.status_css_class()}">
-						<b>@job.name</b>
+						<b>@job.name <small>@job.stage</small></b>
+						@if job.allow_failure
+							<span>allowed to fail</span>
+						@end
 						<span class="ci-status-badge @{job.status_css_class()}">@job.status</span>
 					</div>
 

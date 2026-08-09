@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include '../layout/head.html'
+	</head>
+	<body>
+		@include '../layout/header.html'
+		<div class="content">
+			@include '../layout/repo_menu.html'
+			<h1>Forks</h1>
+			@if forks.len == 0
+				<p>This repository has no visible forks.</p>
+			@else
+				@for listed_repo in forks
+					<div class="repo-list-item">
+						<a href="/@listed_repo.user_name/@listed_repo.name">
+							<strong>@listed_repo.user_name/@listed_repo.name</strong>
+						</a>
+						<p>@listed_repo.description</p>
+					</div>
+				@end
+			@end
+		</div>
+		@include '../layout/footer.html'
+	</body>
+</html>

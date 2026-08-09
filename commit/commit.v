@@ -98,7 +98,7 @@ fn (mut app App) find_repo_commits_as_page(repo_id int, branch_id int, offset in
 
 fn (mut app App) get_repo_commit_count(repo_id int, branch_id int) int {
 	rows := db_exec_values(mut app.db,
-		'select count(*) from ${sql_table('BranchCommit')} where branch_id = ${branch_id}') or {
+		'select count(*) from ${sql_table('BranchCommit')} bc join ${sql_table('Commit')} c on c.id = bc.commit_id where c.repo_id = ${repo_id} and bc.branch_id = ${branch_id}') or {
 		return 0
 	}
 	if rows.len == 0 || rows[0].len == 0 {

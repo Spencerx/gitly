@@ -21,7 +21,11 @@
 					@end
 					<a class="issue-row__author" href="/@author.username">@author.username</a>
 					<span>%pr_wants_to_merge</span>
-					<code>@pr.head_branch</code>
+					@if head_repo.id > 0 && head_repo.id != repo.id
+						<code>@head_repo.user_name/@head_repo.name:@pr.head_branch</code>
+					@else
+						<code>@pr.head_branch</code>
+					@end
 					<span>%pr_into</span>
 					<code>@pr.base_branch</code>
 					<span>&middot; @{pr.relative_time()}</span>
@@ -92,6 +96,33 @@
 			@end
 
 			@if ctx.logged_in
+				<section class="pr-approval-box">
+					<div>
+						<strong>@approval_count / @repo.required_approvals approvals</strong>
+						@if repo.required_approvals == 0
+							<span>No approvals are required.</span>
+						@else if approvals_satisfied
+							<span>Approval requirement satisfied.</span>
+						@else
+							<span>More approvals are required before merge.</span>
+						@end
+						@if approvals.len > 0
+							<small>Approved by
+							@for item in approvals
+								<a href="/@item.user.username">@item.user.username</a>
+							@end
+							</small>
+						@end
+					</div>
+					@if can_approve
+						@if has_approved
+							<form method="post" action="/@repo.user_name/@repo.name/pull/@pr.id/revoke-approval"><button type="submit">Revoke approval</button></form>
+						@else
+							<form method="post" action="/@repo.user_name/@repo.name/pull/@pr.id/approve"><button class="pr-action pr-action--review" type="submit">Approve</button></form>
+						@end
+					@end
+				</section>
+
 				<div class="pr-actions">
 					@if can_merge
 						<form method='post' action='/@repo.user_name/@repo.name/pull/@pr.id/merge' class='pr-action-form'>
@@ -100,6 +131,9 @@
 						<form method='post' action='/@repo.user_name/@repo.name/pull/@pr.id/squash' class='pr-action-form'>
 							<button type='submit' class='pr-action pr-action--merge'>%pr_squash_merge</button>
 						</form>
+					@end
+					@if pr.is_open() && can_merge_branch && !approvals_satisfied
+						<span class="pr-merge-blocked">Merge blocked until @repo.required_approvals approvals are recorded.</span>
 					@end
 					@if can_close
 						<form method='post' action='/@repo.user_name/@repo.name/pull/@pr.id/close' class='pr-action-form'>

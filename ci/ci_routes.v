@@ -9,6 +9,7 @@ import git
 import crypto.hmac
 import crypto.sha256
 import encoding.hex
+import os
 
 struct CiStatusCallback {
 	run_id      string
@@ -27,11 +28,22 @@ pub fn (mut app App) handle_ci_status_callback() veb.Result {
 		return ctx.json_error('Invalid or missing CI callback signature')
 	}
 	callback := json.decode[CiStatusCallback](body) or {
+		ctx.res.set_status(.bad_request)
 		return ctx.json_error('Invalid request body')
 	}
 
 	repo_id := callback.repo_id.int()
 	ci_run_id := callback.run_id.int()
+	if repo_id <= 0 || ci_run_id < 0 || !is_valid_commit_hash(callback.commit_hash)
+		|| !is_safe_ref(callback.branch)
+		|| callback.status !in ['pending', 'running', 'success', 'failure', 'cancelled', 'timed_out'] {
+		ctx.res.set_status(.bad_request)
+		return ctx.json_error('Invalid CI status payload')
+	}
+	app.find_repo_by_id(repo_id) or {
+		ctx.res.set_status(.not_found)
+		return ctx.json_error('Repository not found')
+	}
 	status := ci_status_from_string(callback.status)
 
 	app.upsert_ci_status(repo_id, callback.commit_hash, callback.branch, status, ci_run_id) or {
@@ -46,14 +58,15 @@ pub fn (mut app App) handle_ci_status_callback() veb.Result {
 
 // verify_ci_callback_signature checks the HMAC-SHA256 signature of the raw
 // callback body against the shared ci_secret, using a constant-time compare.
-// When no secret is configured it allows the request (preserving the previous
-// behaviour) but logs a warning; set `ci_secret` in both gitly and gitly_ci to
-// require signed callbacks and stop anyone from spoofing CI status.
+// An unset secret fails closed. Configure ci_secret or GITLY_CI_SECRET in both
+// services; accepting unsigned status changes lets anyone spoof a successful
+// build for any repository.
 fn (mut app App) verify_ci_callback_signature(ctx &Context, body string) bool {
-	secret := app.config.ci_secret
+	env_secret := os.getenv('GITLY_CI_SECRET')
+	secret := if env_secret != '' { env_secret } else { app.config.ci_secret }
 	if secret == '' {
-		app.warn('CI status callback accepted WITHOUT authentication; set ci_secret in gitly and gitly_ci to require signed callbacks')
-		return true
+		app.warn('CI status callback rejected: configure ci_secret or GITLY_CI_SECRET')
+		return false
 	}
 	provided := ctx.get_custom_header('X-Gitly-CI-Signature') or { return false }
 	mac := hmac.new(secret.bytes(), body.bytes(), sha256.sum, sha256.block_size)
@@ -66,10 +79,8 @@ fn (mut app App) verify_ci_callback_signature(ctx &Context, body string) bool {
 pub fn (mut app App) ci_runs(username string, repo_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
-	if !repo.is_public {
-		if repo.user_id != ctx.user.id {
-			return ctx.not_found()
-		}
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
 	}
 
 	// Check if .gitly-ci.yml exists in the repo
@@ -80,8 +91,7 @@ pub fn (mut app App) ci_runs(username string, repo_name string) veb.Result {
 	mut ci_runs := []CiRunListItem{}
 	mut ci_service_error := false
 	if app.config.ci_service_url != '' {
-		runs_url := '${app.config.ci_service_url}/api/v1/runs/repo/${repo.id}'
-		response := http.get(runs_url) or {
+		response := app.ci_service_request(.get, '/api/v1/runs/repo/${repo.id}', '') or {
 			ci_service_error = true
 			http.Response{}
 		}
@@ -114,21 +124,23 @@ pub fn (mut app App) ci_runs(username string, repo_name string) veb.Result {
 pub fn (mut app App) ci_run_detail(username string, repo_name string, run_id_str string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
-	if !repo.is_public {
-		if repo.user_id != ctx.user.id {
-			return ctx.not_found()
-		}
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
 	}
 
 	ci_run_id := run_id_str.int()
+	if !app.repo_owns_ci_run(repo.id, ci_run_id) {
+		return ctx.not_found()
+	}
 
 	// Fetch run details from gitly_ci service
 	if app.config.ci_service_url == '' {
 		return ctx.not_found()
 	}
 
-	ci_url := '${app.config.ci_service_url}/api/v1/runs/${ci_run_id}'
-	response := http.get(ci_url) or { return ctx.not_found() }
+	response := app.ci_service_request(.get, '/api/v1/runs/${ci_run_id}', '') or {
+		return ctx.not_found()
+	}
 
 	if response.status_code != 200 {
 		return ctx.not_found()
@@ -149,20 +161,22 @@ pub fn (mut app App) ci_run_detail(username string, repo_name string, run_id_str
 pub fn (mut app App) ci_restart_run(username string, repo_name string, run_id_str string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
-	// Only repo owner can restart
-	if repo.user_id != ctx.user.id {
+	if !app.can_admin_repo(ctx, repo) {
 		return ctx.not_found()
 	}
 
 	ci_run_id := run_id_str.int()
+	if !app.repo_owns_ci_run(repo.id, ci_run_id) {
+		return ctx.not_found()
+	}
 
 	if app.config.ci_service_url == '' {
 		return ctx.not_found()
 	}
 
-	// Call gitly_ci restart API
-	restart_url := '${app.config.ci_service_url}/api/v1/runs/${ci_run_id}/restart'
-	response := http.post(restart_url, '') or { return ctx.not_found() }
+	response := app.ci_service_request(.post, '/api/v1/runs/${ci_run_id}/restart', '') or {
+		return ctx.not_found()
+	}
 
 	if response.status_code != 200 {
 		return ctx.not_found()
@@ -178,6 +192,26 @@ pub fn (mut app App) ci_restart_run(username string, repo_name string, run_id_st
 		return ctx.redirect('/${username}/${repo_name}/ci/${new_run.id}')
 	}
 
+	return ctx.redirect('/${username}/${repo_name}/ci/${ci_run_id}')
+}
+
+// POST /:username/:repo_name/ci/:run_id_str/cancel - Cancel a CI run.
+@['/:username/:repo_name/ci/:run_id_str/cancel'; post]
+pub fn (mut app App) ci_cancel_run(username string, repo_name string, run_id_str string) veb.Result {
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_admin_repo(ctx, repo) {
+		return ctx.not_found()
+	}
+	ci_run_id := run_id_str.int()
+	if !app.repo_owns_ci_run(repo.id, ci_run_id) || app.config.ci_service_url == '' {
+		return ctx.not_found()
+	}
+	response := app.ci_service_request(.post, '/api/v1/runs/${ci_run_id}/cancel', '') or {
+		return ctx.not_found()
+	}
+	if response.status_code != 200 {
+		return ctx.not_found()
+	}
 	return ctx.redirect('/${username}/${repo_name}/ci/${ci_run_id}')
 }
 
@@ -222,23 +256,27 @@ struct CiApiRunResponse {
 }
 
 struct CiRunDetail {
-	id          int
-	status      string
-	commit_hash string
-	branch      string
-	created_at  int
-	finished_at int
-	jobs        []CiJobDetail
+	id            int
+	status        string
+	commit_hash   string
+	branch        string
+	created_at    int
+	started_at    int
+	finished_at   int
+	error_message string
+	jobs          []CiJobDetail
 }
 
 struct CiJobDetail {
-	id          int
-	name        string
-	status      string
-	exit_code   int
-	started_at  int
-	finished_at int
-	steps       []CiStepDetail
+	id            int
+	name          string
+	stage         string
+	status        string
+	allow_failure bool
+	exit_code     int
+	started_at    int
+	finished_at   int
+	steps         []CiStepDetail
 }
 
 struct CiStepDetail {
@@ -256,6 +294,7 @@ fn (r &CiRunDetail) status_css_class() string {
 		'failure' { 'ci-failure' }
 		'running' { 'ci-running' }
 		'cancelled' { 'ci-cancelled' }
+		'timed_out' { 'ci-failure' }
 		else { 'ci-pending' }
 	}
 }
@@ -284,6 +323,8 @@ fn (j &CiJobDetail) status_css_class() string {
 		'failure' { 'ci-failure' }
 		'running' { 'ci-running' }
 		'cancelled' { 'ci-cancelled' }
+		'timed_out' { 'ci-failure' }
+		'skipped' { 'ci-pending' }
 		else { 'ci-pending' }
 	}
 }
@@ -294,6 +335,8 @@ fn (s &CiStepDetail) status_css_class() string {
 		'failure' { 'ci-failure' }
 		'running' { 'ci-running' }
 		'cancelled' { 'ci-cancelled' }
+		'timed_out' { 'ci-failure' }
+		'skipped' { 'ci-pending' }
 		else { 'ci-pending' }
 	}
 }
@@ -304,6 +347,8 @@ fn (s &CiStepDetail) status_icon() string {
 		'failure' { '✗' }
 		'running' { '⟳' }
 		'cancelled' { '⊘' }
+		'timed_out' { '⌛' }
+		'skipped' { '–' }
 		else { '○' }
 	}
 }

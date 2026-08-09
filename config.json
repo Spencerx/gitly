@@ -4,5 +4,14 @@
 	"avatars_path": "./avatars",
 	"hostname": "gitly.org",
 	"ci_service_url": "http://localhost:8081",
+	"ci_secret": "",
+	"cookie_secure": false,
+	"storage_secret": "",
+	"mirror_allowed_hosts": [],
+	"ssh_enabled": false,
+	"ssh_hostname": "",
+	"ssh_port": 22,
+	"ssh_user": "git",
+	"ssh_authorized_keys_path": "",
 	"usdt_wallet": ""
 }

@@ -253,6 +253,9 @@ fn is_safe_webhook_url(raw string) bool {
 	if scheme != 'http' && scheme != 'https' {
 		return false
 	}
+	if _ := u.user {
+		return false
+	}
 	host := u.hostname()
 	if host == '' {
 		return false
@@ -315,6 +318,9 @@ fn (mut app App) deliver_webhook(wh Webhook, event string, body string) {
 	}
 	req.read_timeout = 10 * time.second
 	req.write_timeout = 10 * time.second
+	req.allow_redirect = false
+	req.max_retries = 1
+	req.stop_receiving_limit = 64 * 1024
 	resp := req.do() or {
 		app.record_webhook_delivery(wh.id, event, 0, err.str())
 		return

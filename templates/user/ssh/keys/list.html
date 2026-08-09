@@ -12,6 +12,11 @@
 
 		<div class="content">
 			<h1>SSH keys</h1>
+			@if app.config.ssh_enabled
+				<p>Use these keys to clone and push repositories over SSH. Authentication keys are written to the configured OpenSSH <code>authorized_keys</code> file.</p>
+			@else
+				<p><b>SSH transport is disabled by the administrator.</b> Your keys remain saved and will become active when SSH is enabled.</p>
+			@end
 
 			<a href="/${ctx.user.username}/settings">Public profile</a>
 			|
@@ -29,7 +34,8 @@
 				@for ssh_key in ssh_keys
 					<div class="ssh-key">
 						<h3>@ssh_key.title</h3>
-						<p>@ssh_key.created_at.relative()</p>
+						<p><code>@ssh_key.fingerprint</code></p>
+						<p>Usage: @ssh_key.usage_type · Added @ssh_key.created_at.relative() · Last used: @{ssh_key.last_used_description()} · Expires: @{ssh_key.expiry_description()}</p>
 						<button class="ssh-key-remove" data-id="@ssh_key.id" data-username="@ctx.user.username" data-title="@ssh_key.title">Remove</button>
 					</div>
 				@end

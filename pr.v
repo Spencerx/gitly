@@ -15,6 +15,7 @@ struct PullRequest {
 	id int @[primary; sql: serial]
 mut:
 	repo_id           int
+	head_repo_id      int
 	author_id         int
 	title             string
 	description       string
@@ -61,6 +62,21 @@ mut:
 	created_at  int
 }
 
+// An approval is current merge-gating state, separate from the immutable
+// review timeline. The unique pair ensures one person can contribute at most
+// one approval regardless of how many reviews they submit.
+struct PrApproval {
+	id         int @[primary; sql: serial]
+	pr_id      int @[unique: 'pr_approval']
+	user_id    int @[unique: 'pr_approval']
+	created_at int
+}
+
+struct PrApprovalView {
+	approval PrApproval
+	user     User
+}
+
 fn (p &PullRequest) is_open() bool {
 	return p.status == int(PrStatus.open)
 }
@@ -91,6 +107,13 @@ fn (p &PullRequest) status_class() string {
 
 fn (p &PullRequest) relative_time() string {
 	return time.unix(p.created_at).relative()
+}
+
+fn (p &PullRequest) head_ref() string {
+	if p.head_repo_id > 0 && p.head_repo_id != p.repo_id {
+		return 'refs/merge-requests/${p.id}/head'
+	}
+	return p.head_branch
 }
 
 fn (p &PullRequest) formatted_title() veb.RawHtml {
@@ -137,20 +160,33 @@ fn (rc &PrReviewComment) relative() string {
 }
 
 fn (mut app App) add_pull_request_with_created_at(repo_id int, author_id int, title string, description string, head string, base string, created_at int) !int {
+	return app.add_pull_request_from_repo_with_created_at(repo_id, 0, author_id, title,
+		description, head, base, created_at)
+}
+
+fn (mut app App) add_pull_request_from_repo_with_created_at(repo_id int, head_repo_id int,
+	author_id int, title string, description string, head string, base string, created_at int) !int {
 	pr := PullRequest{
-		repo_id:     repo_id
-		author_id:   author_id
-		title:       title
-		description: description
-		head_branch: head
-		base_branch: base
-		status:      int(PrStatus.open)
-		created_at:  created_at
+		repo_id:      repo_id
+		head_repo_id: head_repo_id
+		author_id:    author_id
+		title:        title
+		description:  description
+		head_branch:  head
+		base_branch:  base
+		status:       int(PrStatus.open)
+		created_at:   created_at
 	}
 	sql app.db {
 		insert pr into PullRequest
 	}!
 	return db_last_insert_id(mut app.db)
+}
+
+fn (mut app App) add_pull_request_from_repo(repo_id int, head_repo_id int, author_id int,
+	title string, description string, head string, base string) !int {
+	return app.add_pull_request_from_repo_with_created_at(repo_id, head_repo_id, author_id, title,
+		description, head, base, int(time.now().unix()))
 }
 
 fn (mut app App) add_pull_request(repo_id int, author_id int, title string, description string, head string, base string) !int {
@@ -168,6 +204,14 @@ fn (mut app App) pull_request_exists_for_head(repo_id int, head string) bool {
 		select count from PullRequest where repo_id == repo_id && head_branch == head
 	} or { 0 }
 	return rows > 0
+}
+
+fn (mut app App) pull_request_exists_for_source(repo_id int, head_repo_id int, head string) bool {
+	wanted := int(PrStatus.open)
+	return sql app.db {
+		select count from PullRequest where repo_id == repo_id && head_repo_id == head_repo_id
+		&& head_branch == head && status == wanted
+	} or { 0 } > 0
 }
 
 fn (mut app App) find_pull_request_by_id(pr_id int) ?PullRequest {
@@ -279,6 +323,89 @@ fn (mut app App) get_pr_reviews(pr_id int) []PrReview {
 	} or { []PrReview{} }
 }
 
+fn (mut app App) approve_pull_request(pr_id int, user_id int) ! {
+	if pr_id <= 0 || user_id <= 0 {
+		return error('invalid approval')
+	}
+	count := sql app.db {
+		select count from PrApproval where pr_id == pr_id && user_id == user_id
+	} or { 0 }
+	if count > 0 {
+		return
+	}
+	approval := PrApproval{
+		pr_id:      pr_id
+		user_id:    user_id
+		created_at: int(time.now().unix())
+	}
+	sql app.db {
+		insert approval into PrApproval
+	}!
+}
+
+fn (mut app App) revoke_pull_request_approval(pr_id int, user_id int) ! {
+	sql app.db {
+		delete from PrApproval where pr_id == pr_id && user_id == user_id
+	}!
+}
+
+fn (mut app App) pull_request_approval_count(pr_id int) int {
+	return app.find_pull_request_approvals(pr_id).len
+}
+
+fn (app &App) user_approved_pull_request(pr_id int, user_id int) bool {
+	count := sql app.db {
+		select count from PrApproval where pr_id == pr_id && user_id == user_id
+	} or { 0 }
+	return count > 0
+}
+
+fn (mut app App) find_pull_request_approvals(pr_id int) []PrApprovalView {
+	pr := app.find_pull_request_by_id(pr_id) or { return []PrApprovalView{} }
+	repo := app.find_repo_by_id(pr.repo_id) or { return []PrApprovalView{} }
+	approvals := sql app.db {
+		select from PrApproval where pr_id == pr_id order by created_at
+	} or { []PrApproval{} }
+	mut result := []PrApprovalView{cap: approvals.len}
+	for approval in approvals {
+		user := app.get_user_by_id(approval.user_id) or { continue }
+		if !user.is_registered || user.is_blocked || user.id == pr.author_id
+			|| app.repo_access_level(user.id, repo) < project_access_developer {
+			continue
+		}
+		result << PrApprovalView{
+			approval: approval
+			user:     user
+		}
+	}
+	return result
+}
+
+fn (mut app App) pull_request_approvals_satisfied(pr PullRequest, repo Repo) bool {
+	return app.pull_request_approval_count(pr.id) >= repo.required_approvals
+}
+
+fn (mut app App) clear_pull_request_approvals(pr_id int) ! {
+	sql app.db {
+		delete from PrApproval where pr_id == pr_id
+	}!
+}
+
+// New commits invalidate approvals for every open merge request sourced from
+// the updated branch. This mirrors GitLab's safe default and prevents approval
+// of one revision from silently authorizing a different one.
+fn (mut app App) clear_open_pr_approvals_for_head(repo_id int, branch string) ! {
+	wanted := int(PrStatus.open)
+	prs := sql app.db {
+		select from PullRequest where
+		(head_repo_id == repo_id || (head_repo_id == 0 && repo_id == repo_id))
+		&& head_branch == branch && status == wanted
+	} or { []PullRequest{} }
+	for pr in prs {
+		app.clear_pull_request_approvals(pr.id)!
+	}
+}
+
 fn (mut app App) add_pr_review_comment(pr_id int, author_id int, review_id int, file_path string, line_number int, side string, text string) ! {
 	c := PrReviewComment{
 		pr_id:       pr_id
@@ -307,6 +434,9 @@ fn (mut app App) delete_repo_pull_requests(repo_id int) ! {
 	} or { []PullRequest{} }
 	for pr in prs {
 		pr_id := pr.id
+		sql app.db {
+			delete from PrApproval where pr_id == pr_id
+		}!
 		sql app.db {
 			delete from PrComment where pr_id == pr_id
 		}!

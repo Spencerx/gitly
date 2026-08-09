@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		@include '../layout/head.html'
+	</head>
+	<body>
+		@include '../layout/header.html'
+		<div class="content">
+			<h1>Fork @source.user_name/@source.name</h1>
+			<p>A fork copies Git branches and tags while keeping a link to the upstream repository. Issues, merge requests, members, secrets, and deploy keys are not copied.</p>
+			@if ctx.form_error != ''
+				<div class="form-error">@ctx.form_error</div>
+			@end
+			<form class="new-repo__form" method="post">
+				<div class="new-repo__field"><label for="owner">Namespace</label><select id="owner" name="owner">
+					@if selected_owner == ctx.user.username
+						<option value="@ctx.user.username" selected>@ctx.user.username</option>
+					@else
+						<option value="@ctx.user.username">@ctx.user.username</option>
+					@end
+					@for org in orgs
+						@if selected_owner == org.name
+							<option value="@org.name" selected>@org.name</option>
+						@else
+							<option value="@org.name">@org.name</option>
+						@end
+					@end
+				</select></div>
+				<div class="new-repo__field"><label for="name">Repository name</label><input id="name" name="name" value="@source.name" required maxlength="100"></div>
+				<div class="new-repo__field"><label for="description">Description</label><input id="description" name="description" value="@source.description"></div>
+				@if source.is_public
+					<div class="new-repo__field"><label><input type="radio" name="repo_visibility" value="public" checked> Public</label><label><input type="radio" name="repo_visibility" value="private"> Private</label></div>
+				@else
+					<input type="hidden" name="repo_visibility" value="private"><p>This fork must remain private because its source is private.</p>
+				@end
+				<div class="new-repo__field"><label><input type="checkbox" name="default_branch_only"> Include only the default branch</label></div>
+				<button type="submit">Create fork</button>
+			</form>
+		</div>
+		@include '../layout/footer.html'
+	</body>
+</html>

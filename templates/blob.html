@@ -29,7 +29,7 @@
 				</div>
 				<div class="blob-toolbar__actions">
 					<a class="blob-action" href="@raw_url" target="_blank">Raw</a>
-					@if repo.user_id == ctx.user.id
+					@if ctx.logged_in && app.user_can_push_branch(ctx.user.id, repo, branch_name)
 						<a class="blob-action" href="/@username/@repo_name/edit/@branch_name/@path">Edit</a>
 					@end
 				</div>

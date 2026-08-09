@@ -56,8 +56,7 @@ pub fn Git.exec_in_dir_with_env(dir string, args []string, extra_env map[string]
 }
 
 pub fn Git.clone(url string, path string) os.Result {
-	println('new clone url="${url}" path="${path}"')
-	return os.exec(['git', 'clone', '--bare', url, path])
+	return os.exec(['git', '-c', 'http.followRedirects=false', 'clone', '--bare', url, path])
 }
 
 // Git.clone_with_progress runs `git clone --bare --progress` and streams
@@ -69,10 +68,9 @@ pub fn Git.clone_with_progress(url string, path string, progress_path string) os
 }
 
 pub fn Git.clone_with_progress_limit(url string, path string, progress_path string, max_bytes u64) os.Result {
-	println('new clone (progress) url="${url}" path="${path}" progress="${progress_path}"')
 	os.rm(progress_path) or {}
 	mut p := os.new_process('git')
-	p.set_args(['clone', '--bare', '--progress', url, path])
+	p.set_args(['-c', 'http.followRedirects=false', 'clone', '--bare', '--progress', url, path])
 	p.set_redirect_stdio()
 	p.run()
 	mut log := os.open_append(progress_path) or {

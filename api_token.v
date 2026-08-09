@@ -4,7 +4,7 @@ module main
 
 import time
 import crypto.sha256
-import rand
+import crypto.rand
 import encoding.hex
 
 struct ApiToken {
@@ -22,15 +22,15 @@ fn hash_api_token(plain string) string {
 }
 
 fn generate_api_token_plaintext() string {
-	mut buf := []u8{len: 24}
-	for i in 0 .. buf.len {
-		buf[i] = u8(rand.intn(256) or { 0 })
-	}
+	buf := rand.bytes(24) or { return '' }
 	return 'glt_' + hex.encode(buf)
 }
 
 fn (mut app App) add_api_token(user_id int, name string) !(int, string) {
 	plain := generate_api_token_plaintext()
+	if plain == '' {
+		return error('could not generate a secure API token')
+	}
 	t := ApiToken{
 		user_id:    user_id
 		name:       name
@@ -72,5 +72,9 @@ fn (mut app App) user_for_api_token(plain string) ?User {
 	sql app.db {
 		update ApiToken set last_used_at = now where id == id
 	} or {}
-	return app.get_user_by_id(t.user_id)
+	user := app.get_user_by_id(t.user_id) or { return none }
+	if !user.is_registered || user.is_blocked {
+		return none
+	}
+	return user
 }

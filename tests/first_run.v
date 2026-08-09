@@ -2,11 +2,8 @@ import os
 import log
 import net.http
 import time
-import json
+import json2
 import api
-import term
-
-const gitly_url = 'http://127.0.0.1:8080'
 
 const default_branch = 'main'
 
@@ -17,7 +14,10 @@ const test_github_repo_url = 'https://github.com/vlang/pcre'
 const test_github_repo_primary_branch = 'master'
 
 fn main() {
-	before()!
+	mut gitly_process := before()!
+	defer {
+		after(mut gitly_process)
+	}
 
 	test_index_page()
 
@@ -42,13 +42,14 @@ fn main() {
 	assert get_repo_commit_count(token, test_username, 'test1', default_branch) == 0
 	assert get_repo_issue_count(token, test_username, 'test1') == 0
 	assert get_repo_branch_count(token, test_username, 'test1') == 0
+	if !external_fixture_available() {
+		ilog('Public clone fixture is unavailable in this network; local first-run checks passed.')
+		return
+	}
 
 	repo_name := 'test2'
 	test_create_repo(token, repo_name, test_github_repo_url)
-	// wait while repo is cloning
-	time.sleep(5 * time.second)
-	// get repo
-	assert get_repo_commit_count(token, test_username, repo_name, test_github_repo_primary_branch) > 0
+	assert wait_for_repo_commits(token, test_username, repo_name, test_github_repo_primary_branch)
 	assert get_repo_issue_count(token, test_username, repo_name) == 0
 	assert get_repo_branch_count(token, test_username, repo_name) > 0
 	test_repo_page(test_username, repo_name)
@@ -68,39 +69,82 @@ fn main() {
 	// test_refs_page(test_username, repo_name)
 	// test_api_branches_count(test_username, repo_name)
 	ilog('all tests passed!')
-
-	after()!
 }
 
-fn before() ! {
-	cd_executable_dir()!
-
-	ilog('Make sure gitly is not running')
-	kill_gitly_processes()
-
-	remove_database_if_exists()!
-	remove_repos_dir_if_exists()!
-	compile_gitly()
-
-	ilog('Start gitly in the background, then wait till gitly starts and is responding to requests')
-	spawn run_gitly()
-
-	wait_gitly()
+fn first_run_root() string {
+	return os.join_path(os.temp_dir(), 'gitly_first_run_${os.getpid()}')
 }
 
-fn after() ! {
-	remove_database_if_exists()!
-	remove_repos_dir_if_exists()!
-
-	ilog('Ensure gitly is stopped')
-	kill_gitly_processes()
+fn first_run_port() int {
+	return 20_000 + os.getpid() % 20_000
 }
 
-fn run_gitly() {
-	gitly_process := os.execute('./gitly.exe &')
-	if gitly_process.exit_code != 0 {
-		exit_with_message(gitly_process.str())
+fn external_fixture_available() bool {
+	result := os.exec(['git', 'ls-remote', '--exit-code', test_github_repo_url])
+	return result.exit_code == 0
+}
+
+fn before() !&os.Process {
+	cd_repository_root()!
+	test_root := first_run_root()
+	if os.exists(test_root) {
+		os.rmdir_all(test_root)!
 	}
+	os.mkdir_all(test_root)!
+	os.setenv('GITLY_SQLITE_PATH', os.join_path(test_root, 'gitly.sqlite'), true)
+	os.setenv('GITLY_REPO_STORAGE_PATH', os.join_path(test_root, 'repos'), true)
+	os.setenv('GITLY_ARCHIVE_PATH', os.join_path(test_root, 'archives'), true)
+	os.setenv('GITLY_AVATARS_PATH', os.join_path(test_root, 'avatars'), true)
+	os.setenv('GITLY_PORT', first_run_port().str(), true)
+	// Some CI/network sandboxes resolve public hosts through an internal proxy.
+	// Explicitly trust the one fixture host while keeping the production default
+	// fail-closed for private/link-local destinations.
+	os.setenv('GITLY_MIRROR_ALLOWED_HOSTS', 'github.com', true)
+
+	binary := os.join_path(test_root, 'gitly-first-run')
+	compile_gitly(binary) or {
+		cleanup_first_run_files()
+		return err
+	}
+	ilog('Start an isolated Gitly process and wait until it responds')
+	mut process := os.new_process(binary)
+	process.run()
+	wait_gitly(mut process) or {
+		stop_gitly(mut process)
+		cleanup_first_run_files()
+		return err
+	}
+	return process
+}
+
+fn after(mut process os.Process) {
+	stop_gitly(mut process)
+	cleanup_first_run_files()
+}
+
+fn stop_gitly(mut process os.Process) {
+	if process.is_alive() {
+		process.signal_term()
+		for _ in 0 .. 20 {
+			if !process.is_alive() {
+				break
+			}
+			time.sleep(50 * time.millisecond)
+		}
+		if process.is_alive() {
+			process.signal_kill()
+		}
+	}
+	process.wait()
+	process.close()
+}
+
+fn cleanup_first_run_files() {
+	for name in ['GITLY_SQLITE_PATH', 'GITLY_REPO_STORAGE_PATH', 'GITLY_ARCHIVE_PATH',
+		'GITLY_AVATARS_PATH', 'GITLY_PORT', 'GITLY_MIRROR_ALLOWED_HOSTS'] {
+		os.unsetenv(name)
+	}
+	os.rmdir_all(first_run_root()) or {}
 }
 
 @[noreturn]
@@ -113,52 +157,44 @@ fn ilog(message string) {
 	log.info(message)
 }
 
-fn cd_executable_dir() ! {
-	executable_dir := os.dir(os.executable())
-	// Ensure that we are always running in the gitly folder, no matter what is the starting one:
-	os.chdir(os.dir(executable_dir))!
+fn cd_repository_root() ! {
+	repository_root := os.real_path(os.join_path(os.dir(@FILE), '..'))
+	os.chdir(repository_root)!
 
 	ilog('Testing first gitly run.')
 }
 
-fn kill_gitly_processes() {
-	os.execute('pkill -9 gitly.exe')
-}
-
-fn remove_database_if_exists() ! {
-	ilog('Remove old gitly DB')
-
-	if os.exists('gitly.sqlite') {
-		os.rm('gitly.sqlite')!
-	}
-}
-
-fn remove_repos_dir_if_exists() ! {
-	ilog('Remove repos directory')
-
-	if os.exists('repos') {
-		os.rmdir_all('repos')!
-	}
-}
-
-fn compile_gitly() {
+fn compile_gitly(binary string) ! {
 	ilog('Compile gitly')
-	// Note that using `-d use_openssl` prevents tcc from working, so the compilation will be much slower:
-	os.execute('v -d use_libbacktrace -cg -keepc -d use_openssl -o gitly.exe .')
-	ilog('Compiled gitly.exe, size: ${os.file_size('gitly.exe')}')
+	mut process := os.new_process(@VEXE)
+	process.set_args(['-d', 'sqlite', '-d', 'use_openssl', '-o', binary, '.'])
+	process.set_redirect_stdio()
+	process.run()
+	process.wait()
+	output := process.stdout_slurp() + process.stderr_slurp()
+	exit_code := process.code
+	process.close()
+	if exit_code != 0 {
+		return error('Could not compile Gitly (${exit_code}): ${output}')
+	}
+	ilog('Compiled isolated Gitly binary, size: ${os.file_size(binary)}')
 }
 
-fn wait_gitly() {
+fn wait_gitly(mut process os.Process) ! {
 	for waiting_cycles := 0; waiting_cycles < 50; waiting_cycles++ {
 		ilog('\twait: ${waiting_cycles}')
 		time.sleep(100 * time.millisecond)
+		if !process.is_alive() {
+			return error('Gitly exited before it became ready')
+		}
 		http.get(prepare_url('')) or { continue }
-		break
+		return
 	}
+	return error('Timed out waiting for Gitly to start')
 }
 
 fn prepare_url(path string) string {
-	return '${gitly_url}/${path}'
+	return 'http://127.0.0.1:${first_run_port()}/${path}'
 }
 
 fn test_index_page() {
@@ -272,7 +308,7 @@ fn test_api_branches_count(username string, repo_name string) {
 
 	assert api_branches_count_result.status_code == 200
 
-	response_json := json.decode[api.ApiBranchCount](api_branches_count_result.body) or {
+	response_json := json2.decode[api.ApiBranchCount](api_branches_count_result.body) or {
 		exit_with_message(err.str())
 	}
 	assert response_json.result > 0
@@ -328,10 +364,10 @@ fn test_settings_page(username string) {
 fn test_blob_page(username string, repo_name string, branch_name string, path string) {
 	url := '${username}/${repo_name}/blob/${branch_name}/${path}'
 	ilog('Testing the new blob /${url} page is up')
-	blob_page_result := http.fetch(
+	blob_page_result := http.fetch(http.FetchConfig{
 		method: .get
 		url:    prepare_url(url)
-	) or { exit_with_message(err.str()) }
+	}) or { exit_with_message(err.str()) }
 
 	assert blob_page_result.status_code == 200
 	assert blob_page_result.body.str().contains('m := r.match_str')
@@ -351,13 +387,13 @@ fn test_endpoint_page(endpoint string, pagename string) {
 fn test_login_with_token(username string, token string) {
 	ilog('Try to login in with `${username}` user token')
 
-	login_result := http.fetch(
+	login_result := http.fetch(http.FetchConfig{
 		method:  .get
 		cookies: {
 			'token': token
 		}
 		url:     prepare_url(username)
-	) or { exit_with_message(err.str()) }
+	}) or { exit_with_message(err.str()) }
 
 	ilog('Ensure that after login, there is a signed in as `${username}` message')
 
@@ -369,46 +405,54 @@ fn test_create_repo(token string, name string, clone_url string) {
 	description := 'test description'
 	repo_visibility := 'public'
 
-	response := http.fetch(
+	response := http.fetch(http.FetchConfig{
 		method:  .post
 		cookies: {
 			'token': token
 		}
 		url:     prepare_url('new')
 		data:    'name=${name}&description=${description}&clone_url=${clone_url}&repo_visibility=${repo_visibility}&no_redirect=1'
-	) or { exit_with_message(err.str()) }
+	}) or { exit_with_message(err.str()) }
 
 	assert response.status_code == 200
 	assert response.body == 'ok'
 }
 
 fn get_repo_commit_count(token string, username string, repo_name string, branch_name string) int {
-	response := http.fetch(
+	response := http.fetch(http.FetchConfig{
 		method:  .get
 		cookies: {
 			'token': token
 		}
 		url:     prepare_url('api/v1/${username}/${repo_name}/${branch_name}/commits/count')
-	) or { exit_with_message(err.str()) }
+	}) or { exit_with_message(err.str()) }
 
-	response_json := json.decode[api.ApiCommitCount](response.body) or {
+	response_json := json2.decode[api.ApiCommitCount](response.body) or {
 		exit_with_message(err.str())
 	}
-	dump(response_json.result)
-
 	return response_json.result
 }
 
+fn wait_for_repo_commits(token string, username string, repo_name string, branch_name string) bool {
+	for _ in 0 .. 120 {
+		if get_repo_commit_count(token, username, repo_name, branch_name) > 0 {
+			return true
+		}
+		time.sleep(500 * time.millisecond)
+	}
+	return false
+}
+
 fn get_repo_issue_count(token string, username string, repo_name string) int {
-	response := http.fetch(
+	response := http.fetch(http.FetchConfig{
 		method:  .get
 		cookies: {
 			'token': token
 		}
 		url:     prepare_url('api/v1/${username}/${repo_name}/issues/count')
-	) or { exit_with_message(err.str()) }
+	}) or { exit_with_message(err.str()) }
 
-	response_json := json.decode[api.ApiIssueCount](response.body) or {
+	response_json := json2.decode[api.ApiIssueCount](response.body) or {
 		exit_with_message(err.str())
 	}
 
@@ -416,15 +460,15 @@ fn get_repo_issue_count(token string, username string, repo_name string) int {
 }
 
 fn get_repo_branch_count(token string, username string, repo_name string) int {
-	response := http.fetch(
+	response := http.fetch(http.FetchConfig{
 		method:  .get
 		cookies: {
 			'token': token
 		}
 		url:     prepare_url('api/v1/${username}/${repo_name}/branches/count')
-	) or { exit_with_message(err.str()) }
+	}) or { exit_with_message(err.str()) }
 
-	response_json := json.decode[api.ApiBranchCount](response.body) or {
+	response_json := json2.decode[api.ApiBranchCount](response.body) or {
 		exit_with_message(err.str())
 	}
 

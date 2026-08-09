@@ -1,6 +1,7 @@
 module main
 
 import crypto.sha256
+import compress.gzip
 
 // Regression tests for the input validation that guards git command
 // construction in create_file_in_bare_repo (see repo/file_routes.v). These
@@ -13,6 +14,7 @@ fn test_is_valid_repo_file_path_accepts_normal_paths() {
 	assert is_valid_repo_file_path('src/main.v')
 	assert is_valid_repo_file_path('dir/file,with,commas.txt')
 	assert is_valid_repo_file_path('a/b/c/d.e')
+	assert is_valid_repo_file_path('release..notes.txt')
 }
 
 fn test_is_valid_repo_file_path_rejects_dangerous_paths() {
@@ -40,6 +42,11 @@ fn test_is_safe_ref_rejects_injection_attempts() {
 	assert !is_safe_ref('master`id`')
 	assert !is_safe_ref('a..b') // ref traversal
 	assert !is_safe_ref('branch with spaces')
+	assert !is_safe_ref('/main')
+	assert !is_safe_ref('main/')
+	assert !is_safe_ref('.hidden')
+	assert !is_safe_ref('release.lock')
+	assert !is_safe_ref('feature//nested')
 }
 
 // Webhook SSRF guard: the IP classifiers must reject internal destinations and
@@ -95,4 +102,107 @@ fn test_legacy_sha256_hashes_still_verify() {
 	assert password_hash_is_legacy(legacy)
 	assert compare_password_with_hash('hunter2', salt, legacy)
 	assert !compare_password_with_hash('nope', salt, legacy)
+}
+
+fn test_state_changing_request_source_must_match_host() {
+	assert url_source_matches_host('https://gitly.example', 'gitly.example')
+	assert url_source_matches_host('https://gitly.example/repo/settings', 'gitly.example')
+	assert url_source_matches_host('http://localhost:8080/new', 'localhost:8080')
+	assert url_source_matches_host('https://gitly.example:443/new', 'gitly.example:443')
+	assert !url_source_matches_host('https://gitly.example.attacker.test/new', 'gitly.example')
+	assert !url_source_matches_host('https://attacker.test/new', 'gitly.example')
+	assert !url_source_matches_host('null', 'gitly.example')
+	assert !url_source_matches_host('javascript:alert(1)', 'gitly.example')
+}
+
+fn test_session_tokens_are_stored_as_hashes() {
+	plain := 'a-session-token'
+	hashed := hash_session_token(plain)
+	assert hashed != plain
+	assert hashed.len == 64
+	assert hash_session_token(plain) == hashed
+}
+
+fn test_user_content_size_limits() {
+	assert valid_title('A useful title')
+	assert !valid_title('  ')
+	assert !valid_title('x'.repeat(max_title_len + 1))
+	assert valid_comment('Looks good')
+	assert !valid_comment('')
+	assert !valid_comment('x'.repeat(max_comment_len + 1))
+	assert valid_body('x'.repeat(max_body_len))
+	assert !valid_body('x'.repeat(max_body_len + 1))
+}
+
+fn test_ssh_public_key_shape_validation() {
+	valid := 'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIPTp8P3nHx3Eu0PUM1Op46RGvl/9Ln+w8pqoW5b+RF9y test@example'
+	assert is_valid_ssh_public_key(valid)
+	assert ssh_key_fingerprint(valid) or { '' } == 'SHA256:pFeDxNVqoJfBCYeygw1Qlsv2xruZomuWmeYB7G9DN3k'
+	assert !is_valid_ssh_public_key('')
+	assert !is_valid_ssh_public_key('not-a-key AAAAB3NzaC1yc2EAAAADAQABAAABAQCexample')
+	assert !is_valid_ssh_public_key('ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIPTp8P3nHx3Eu0PUM1Op46RGvl/9Ln+w8pqoW5b+RF9y')
+	assert !is_valid_ssh_public_key('ssh-ed25519 ../../etc/passwd')
+}
+
+fn test_ssh_forced_command_parser_is_strict() {
+	target := parse_ssh_original_command("git-upload-pack 'alice/project.git'") or {
+		panic('valid command was rejected')
+	}
+	assert target.service == 'git-upload-pack'
+	assert target.owner == 'alice'
+	assert target.repo_name == 'project'
+	assert parse_ssh_original_command("git-receive-pack 'team/repo.git'") != none
+	assert parse_ssh_original_command("git-upload-archive 'alice/project.git'") == none
+	assert parse_ssh_original_command("git-upload-pack '/etc/passwd'") == none
+	assert parse_ssh_original_command("git-upload-pack 'alice/../secret.git'") == none
+	assert parse_ssh_original_command("git-upload-pack 'alice/project.git'; id") == none
+}
+
+fn test_authorized_keys_managed_block_preserves_admin_keys() {
+	existing := 'ssh-ed25519 external-admin admin@example\n\n${ssh_authorized_keys_begin}\nold managed key\n${ssh_authorized_keys_end}\n'
+	updated := replace_managed_authorized_keys(existing, [
+		'restrict,command="gitly" ssh-ed25519 managed',
+	])
+	assert updated.contains('ssh-ed25519 external-admin admin@example')
+	assert !updated.contains('old managed key')
+	assert updated.contains('restrict,command="gitly" ssh-ed25519 managed')
+	assert updated.count(ssh_authorized_keys_begin) == 1
+	assert updated.count(ssh_authorized_keys_end) == 1
+}
+
+fn test_commit_messages_are_escaped_before_rendering() {
+	plain := File{
+		last_msg: '<img src=x onerror=alert(1)>'
+	}.format_commit_message().str()
+	assert !plain.contains('<img')
+	assert plain.contains('&lt;img')
+
+	linked := File{
+		last_msg: '<b>fix</b> #42'
+	}.format_commit_message().str()
+	assert linked.contains('&lt;b&gt;fix&lt;/b&gt;')
+	assert linked.contains('>#42</a>')
+}
+
+fn test_commit_hash_validation_rejects_git_options() {
+	assert is_valid_commit_hash('deadbeef')
+	assert is_valid_commit_hash('0123456789abcdef0123456789abcdef01234567')
+	assert !is_valid_commit_hash('')
+	assert !is_valid_commit_hash('--help')
+	assert !is_valid_commit_hash('deadbeef;touch')
+	assert !is_valid_commit_hash('not-a-hash')
+}
+
+fn test_git_gzip_body_decompression_is_bounded() {
+	original := 'git-pack-data'.repeat(10_000)
+	compressed := gzip.compress(original.bytes())!
+	decoded := decompress_git_body(compressed.bytestr(), original.len)!
+	assert decoded == original
+
+	mut rejected := false
+	decompress_git_body(compressed.bytestr(), 1024) or {
+		rejected = true
+		assert err.msg().contains('too large')
+	}
+	assert rejected
 }

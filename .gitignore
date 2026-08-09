@@ -23,6 +23,7 @@ avatars/
 
 *~
 gitly.exe
+gitly_sqlite
 .claude
 build
 deploy

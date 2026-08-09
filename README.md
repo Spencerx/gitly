@@ -1,72 +1,100 @@
 # Gitly
+
 ![CI](https://github.com/vlang/gitly/workflows/CI/badge.svg?branch=master)
 
-GitHub/GitLab alternative written in V.
+Gitly is a lightweight, self-hosted GitHub/GitLab alternative written in V.
 
-https://gitly.org
+It provides:
 
-- Light and fast
-- Minimal amount of RAM usage (works great on the cheapest $3.5 AWS Lightsail instance)
-- Easy to deploy (a single <1 MB binary that includes compiled templates)
-- Works without JavaScript
-- Detailed language stats for each directory
-- "Top files" feature to give an overview of the project
+- Multiple users, personal and organization repositories, and public/private visibility
+- Git clone, fetch, and push over HTTP(S) and OpenSSH
+- Repository browsing, syntax highlighting, Markdown rendering, language statistics, and a “Top files” view
+- Issues, merge requests with reviews, required approvals, squash/merge support, discussions, projects, milestones, releases, stars, and watches
+- Reporter/Developer/Maintainer project roles and protected branches with wildcard rules, push/merge controls, deletion protection, and force-push rejection
+- Webhooks, API tokens, two-factor authentication, security logs, and optional CI integration
+- Repository forks with upstream synchronization and cross-fork merge requests
+- Scheduled/manual pull and push mirrors over HTTPS or SSH, with encrypted credentials
+- SQLite or PostgreSQL storage and compiled-in templates
 
-**This is beta software**
+Gitly is beta software. It is a lightweight forge rather than a complete GitLab distribution; advanced CI/CD, registries, enterprise identity, security scanning, LFS, and a repository wiki remain outside the implemented foundation.
 
-The V web framework and Gitly are at an early stage of development. Lots of features are missing.
-The biggest missing features that will be implemented soon:
+The current GitLab capability comparison and the remaining implementation sequence are documented in [docs/gitlab-parity.md](docs/gitlab-parity.md). Gitly is intentionally described as a lightweight alternative, not as complete GitLab parity while major platform areas remain outstanding.
 
-- [x] Multiple users and multiple repos
-- [x] `git push`
-- [ ] Access via ssh
-- [ ] Pull requests
+## Build and run
+
+A recent V compiler, Git, and a C compiler are required. `sassc` is optional because the build script can download a prebuilt stylesheet. The Markdown module is included in this repository.
+
+Build with:
 
 ```sh
-v build.vsh
+v run build.vsh
 ./gitly
 ```
 
-Gitly builds against PostgreSQL by default. Create the default PostgreSQL role/database with:
+Gitly builds against PostgreSQL by default. Create the default local role and database with:
 
 ```sh
 v run setup_db.vsh
 ```
 
-To build a SQLite-backed binary instead, use:
+To use SQLite instead:
 
 ```sh
-v -d sqlite .
+v -d sqlite -o gitly .
 ./gitly
 ```
 
-The SQLite database path defaults to `gitly.sqlite` and can be changed with `sqlite.path` in
-`config.json` or `GITLY_SQLITE_PATH`. PostgreSQL settings can be changed with `pg` in
-`config.json`, `GITLY_DB_*` environment variables, or the usual `PG*` environment variables.
+The SQLite database defaults to `gitly.sqlite`; change it with `sqlite.path` in `config.json` or `GITLY_SQLITE_PATH`. Repository, archive, and avatar storage can be overridden with `GITLY_REPO_STORAGE_PATH`, `GITLY_ARCHIVE_PATH`, and `GITLY_AVATARS_PATH`. PostgreSQL accepts the `pg` configuration block, `GITLY_DB_*` variables, the usual `PG*` variables, or `DATABASE_URL`.
 
-If you don't want to install `sassc`, you can simply run
+System libraries:
 
+- SQLite: `libsqlite3-dev` on Ubuntu/Debian
+- PostgreSQL: `libpq-dev` on Ubuntu/Debian or `brew install libpq` on macOS
+- Optional stylesheet compilation: `sassc`
+
+## Production configuration
+
+Review `config.json` before deployment:
+
+- Set `hostname` to the public host.
+- Set `cookie_secure` to `true` whenever the site is served over HTTPS.
+- Set `ci_secret` to a long random value if CI is enabled, and configure the same secret in the CI service. CI callbacks are rejected when this secret is empty. `GITLY_CI_SECRET` can override the Gitly-side value.
+- Set `GITLY_STORAGE_SECRET` to a long random value before saving credentialed repository mirrors. Mirror passwords, access tokens, and SSH private keys fail closed when encryption is not configured.
+- Keep the CI service and database on trusted networks and terminate HTTPS at Gitly or a reverse proxy.
+
+### SSH transport
+
+Gitly uses the host OpenSSH server instead of embedding a second SSH daemon. Configure a dedicated SSH account and set:
+
+```sh
+export GITLY_SSH_ENABLED=true
+export GITLY_SSH_HOSTNAME=git.example.com
+export GITLY_SSH_PORT=22
+export GITLY_SSH_USER=git
+export GITLY_SSH_AUTHORIZED_KEYS_PATH=/home/git/.ssh/authorized_keys
 ```
-curl https://gitly.org/css/gitly.css --output static/css/gitly.css
+
+The Gitly process must be able to atomically update that file. It preserves entries outside its managed block and installs restricted forced commands for active authentication and deploy keys. See [docs/ssh.md](docs/ssh.md) for the OpenSSH setup and security model.
+
+Fork and mirror behavior, including private-source visibility, divergence handling, credential encryption, SSH host-key pinning, and internal-host allowlisting, is documented in [docs/repository-forks-mirrors.md](docs/repository-forks-mirrors.md).
+
+## Tests
+
+Run the tracked test suite with SQLite support:
+
+```sh
+v -d sqlite test $(git ls-files '*_test.v')
 ```
 
+The end-to-end first-run check uses a process-specific port and isolated temporary database/storage, then clones a public repository:
 
-Required dependencies:
-* V 0.4.2 93ff40a (https://vlang.io)
-* SQLite (Ubuntu/Debian: `libsqlite3-dev`)
-* PostgreSQL client library (Ubuntu/Debian: `libpq-dev`, macOS: `brew install libpq`)
-* Markdown (`v install markdown`)
-* sassc
+```sh
+v run tests/first_run.v
+```
 
+## Notable design goals
 
-### Features
-
-- Track performance in CI (e.g. compare certain binary performance across different commits)
-- Run only certain actions for commits (e.g. you're a fixing a bug that involves only a certain OS, and you don't want to wait for other CI)
-- Prioritize CI runs (e.g. this PR must be handled first, then the rest, or this CI job must always run first)
-
-- "Top files" mode
-- Release files can only be generated by CI/CD, with the version of the tree used always available. This prevents malware binaries.
-
-![](https://user-images.githubusercontent.com/687996/85933714-b195fe80-b8da-11ea-9ddd-09cadc2103e4.png)
-
+- Small memory and deployment footprint
+- Useful repository navigation without requiring JavaScript
+- CI-aware releases whose source tree remains identifiable
+- Explicit repository-transfer acceptance, so another user cannot force content into an account namespace

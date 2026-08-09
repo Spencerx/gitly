@@ -214,19 +214,43 @@ pub fn (mut app App) new_pull_request_form(mut ctx Context, username string, rep
 	branches := app.get_all_repo_branches(repo.id)
 	base := if 'base' in ctx.query { ctx.query['base'] } else { repo.primary_branch }
 	head := if 'head' in ctx.query { ctx.query['head'] } else { '' }
+	requested_head_repo_id := if 'head_repo' in ctx.query {
+		ctx.query['head_repo'].int()
+	} else {
+		repo.id
+	}
+	head_repo := app.find_repo_by_id(requested_head_repo_id) or { repo }
+	if !app.repos_share_fork_network(repo.id, head_repo.id)
+		|| !app.user_has_repo_read_access(ctx.user.id, head_repo) {
+		return ctx.not_found()
+	}
+	head_repo_id := head_repo.id
+	head_branches := app.get_all_repo_branches(head_repo.id)
 	mut commits := []Commit{}
 	mut file_diffs := []FileDiff{}
 	mut suggested_title := ''
 	mut error_msg := ''
 	mut has_compare := false
-	if head != '' && head != base {
+	if head != '' && (head_repo.id != repo.id || head != base) {
 		has_compare = true
-		if !app.contains_repo_branch(repo.id, head) || !app.contains_repo_branch(repo.id, base) {
+		if !app.contains_repo_branch(head_repo.id, head) || !app.contains_repo_branch(repo.id, base) {
 			error_msg = 'Both base and compare branches must exist in this repository.'
 			has_compare = false
 		} else {
-			commits = repo.list_commits_between(base, head)
-			raw_diff := repo.diff_branches(base, head)
+			mut compare_ref := head
+			if head_repo.id != repo.id {
+				compare_ref = 'refs/gitly-comparisons/${ctx.user.id}/${head_repo.id}'
+				fetch_fork_branch_into(repo, head_repo, head, compare_ref) or {
+					error_msg = err.str()
+					has_compare = false
+				}
+			}
+			commits = if has_compare {
+				repo.list_commits_between(base, compare_ref)
+			} else {
+				[]Commit{}
+			}
+			raw_diff := if has_compare { repo.diff_branches(base, compare_ref) } else { '' }
 			file_diffs = parse_unified_diff(raw_diff)
 			if commits.len > 0 {
 				suggested_title = commits[0].message
@@ -251,26 +275,52 @@ pub fn (mut app App) handle_create_pull_request(mut ctx Context, username string
 	description := ctx.form['description']
 	head := ctx.form['head']
 	base := ctx.form['base']
-	if validation.is_string_empty(title) || validation.is_string_empty(head)
+	head_repo_id := ctx.form['head_repo_id'].int()
+	head_repo := app.find_repo_by_id(head_repo_id) or { return ctx.not_found() }
+	if !app.repos_share_fork_network(repo.id, head_repo.id)
+		|| !app.user_has_repo_read_access(ctx.user.id, head_repo) {
+		return ctx.not_found()
+	}
+	if !valid_title(title) || !valid_body(description) || validation.is_string_empty(head)
 		|| validation.is_string_empty(base) {
 		ctx.error('Title, head and base branches are required')
 		return ctx.redirect('/${username}/${repo_name}/compare?base=${base}&head=${head}')
 	}
-	if head == base {
+	if head_repo.id == repo.id && head == base {
 		ctx.error('Head and base must differ')
 		return ctx.redirect('/${username}/${repo_name}/compare')
 	}
-	if !app.contains_repo_branch(repo.id, head) || !app.contains_repo_branch(repo.id, base) {
+	if !app.contains_repo_branch(head_repo.id, head) || !app.contains_repo_branch(repo.id, base) {
 		ctx.error('Branches not found')
 		return ctx.redirect('/${username}/${repo_name}/compare')
 	}
-	commits := repo.list_commits_between(base, head)
+	mut compare_ref := head
+	if head_repo.id != repo.id {
+		compare_ref = 'refs/gitly-comparisons/${ctx.user.id}/${head_repo.id}'
+		fetch_fork_branch_into(repo, head_repo, head, compare_ref) or {
+			ctx.error(err.str())
+			return ctx.redirect('/${username}/${repo_name}/compare')
+		}
+	}
+	commits := repo.list_commits_between(base, compare_ref)
 	if commits.len == 0 {
 		ctx.error('No commits between base and head')
 		return ctx.redirect('/${username}/${repo_name}/compare?base=${base}&head=${head}')
 	}
-	pr_id := app.add_pull_request(repo.id, ctx.user.id, title, description, head, base) or {
+	stored_head_repo_id := if head_repo.id == repo.id { 0 } else { head_repo.id }
+	if app.pull_request_exists_for_source(repo.id, stored_head_repo_id, head) {
+		ctx.error('An open merge request already exists for this source branch')
+		return ctx.redirect('/${username}/${repo_name}/compare')
+	}
+	pr_id := app.add_pull_request_from_repo(repo.id, stored_head_repo_id, ctx.user.id, title,
+		description, head, base) or {
 		ctx.error('Could not create pull request')
+		return ctx.redirect('/${username}/${repo_name}/compare')
+	}
+	created_pr := app.find_pull_request_by_id(pr_id) or { return ctx.not_found() }
+	app.refresh_cross_fork_pr_head(repo, created_pr) or {
+		app.set_pr_status(pr_id, .closed) or {}
+		ctx.error(err.str())
 		return ctx.redirect('/${username}/${repo_name}/compare')
 	}
 	app.increment_repo_open_prs(repo.id) or { app.info(err.str()) }
@@ -298,7 +348,13 @@ pub fn (mut app App) pull_request(mut ctx Context, username string, repo_name st
 		return ctx.not_found()
 	}
 	author := app.get_user_by_id(pr.author_id) or { return ctx.not_found() }
-	commits := repo.list_commits_between(pr.base_branch, pr.head_branch)
+	head_repo := if pr.head_repo_id > 0 {
+		app.find_repo_by_id(pr.head_repo_id) or { Repo{} }
+	} else {
+		repo
+	}
+	app.refresh_cross_fork_pr_head(repo, pr) or { ctx.error(err.str()) }
+	commits := repo.list_commits_between(pr.base_branch, pr.head_ref())
 	comments := app.get_pr_comments(pr.id)
 	reviews := app.get_pr_reviews(pr.id)
 	rcomments := app.get_pr_review_comments(pr.id)
@@ -333,8 +389,16 @@ pub fn (mut app App) pull_request(mut ctx Context, username string, repo_name st
 		}
 	}
 	timeline.sort(a.created_at < b.created_at)
-	is_repo_owner := repo.user_id == ctx.user.id
-	can_merge := is_repo_owner && pr.is_open()
+	is_repo_owner := app.can_admin_repo(ctx, repo)
+	approval_count := app.pull_request_approval_count(pr.id)
+	approvals := app.find_pull_request_approvals(pr.id)
+	approvals_satisfied := approval_count >= repo.required_approvals
+	has_approved := ctx.logged_in && app.user_approved_pull_request(pr.id, ctx.user.id)
+	can_approve := ctx.logged_in && pr.is_open() && pr.author_id != ctx.user.id
+		&& app.repo_access_level(ctx.user.id, repo) >= project_access_developer
+	can_merge_branch := ctx.logged_in
+		&& app.user_can_merge_branch(ctx.user.id, repo, pr.base_branch)
+	can_merge := can_merge_branch && approvals_satisfied && pr.is_open()
 	can_close := pr.is_open() && (is_repo_owner || pr.author_id == ctx.user.id)
 	can_reopen := pr.is_closed() && (is_repo_owner || pr.author_id == ctx.user.id)
 	ctx.set_page_title(['${pr.title} #${pr.id}', '${repo.user_name}/${repo.name}'])
@@ -353,7 +417,8 @@ pub fn (mut app App) pull_request_files(mut ctx Context, username string, repo_n
 		return ctx.not_found()
 	}
 	author := app.get_user_by_id(pr.author_id) or { return ctx.not_found() }
-	raw_diff := repo.diff_branches(pr.base_branch, pr.head_branch)
+	app.refresh_cross_fork_pr_head(repo, pr) or { ctx.error(err.str()) }
+	raw_diff := repo.diff_branches(pr.base_branch, pr.head_ref())
 	file_diffs := parse_unified_diff(raw_diff)
 	mut all_adds := 0
 	mut all_dels := 0
@@ -385,12 +450,15 @@ pub fn (mut app App) handle_add_pr_comment(mut ctx Context, username string, rep
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
 	}
 	text := ctx.form['text']
-	if validation.is_string_empty(text) {
+	if !valid_comment(text) {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
 	app.add_pr_comment(pr.id, ctx.user.id, text) or {
@@ -408,16 +476,28 @@ pub fn (mut app App) handle_submit_review(mut ctx Context, username string, repo
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
 	}
 	body := ctx.form['body']
 	state_str := ctx.form['state']
+	if !valid_body(body) {
+		ctx.error('Review body is too long')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}/files')
+	}
 	state := match state_str {
 		'approved' { 1 }
 		'changes_requested' { 2 }
 		else { 0 }
+	}
+	if state == 1 && (pr.author_id == ctx.user.id
+		|| app.repo_access_level(ctx.user.id, repo) < project_access_developer) {
+		ctx.error('Only eligible Developers or Maintainers can approve this merge request')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}/files')
 	}
 
 	review_id := app.add_pr_review(pr.id, ctx.user.id, state, body) or {
@@ -430,7 +510,7 @@ pub fn (mut app App) handle_submit_review(mut ctx Context, username string, repo
 			continue
 		}
 		text := val.trim_space()
-		if text == '' {
+		if text == '' || !valid_comment(text) {
 			continue
 		}
 		// rc::file::side::line
@@ -448,6 +528,50 @@ pub fn (mut app App) handle_submit_review(mut ctx Context, username string, repo
 	if body != '' {
 		app.increment_pr_comments(pr.id) or {}
 	}
+	if state == 1 {
+		app.approve_pull_request(pr.id, ctx.user.id) or { ctx.error('Could not record approval') }
+	} else if state == 2 {
+		app.revoke_pull_request_approval(pr.id, ctx.user.id) or {}
+	}
+	return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+}
+
+@['/:username/:repo_name/pull/:id/approve'; post]
+pub fn (mut app App) handle_approve_pr(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	if !ctx.logged_in {
+		return ctx.redirect_to_login()
+	}
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
+	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
+	if pr.repo_id != repo.id || !pr.is_open() || pr.author_id == ctx.user.id
+		|| app.repo_access_level(ctx.user.id, repo) < project_access_developer {
+		return ctx.not_found()
+	}
+	app.approve_pull_request(pr.id, ctx.user.id) or {
+		ctx.error('Could not approve this merge request')
+	}
+	return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+}
+
+@['/:username/:repo_name/pull/:id/revoke-approval'; post]
+pub fn (mut app App) handle_revoke_pr_approval(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	if !ctx.logged_in {
+		return ctx.redirect_to_login()
+	}
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
+	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
+	if pr.repo_id != repo.id {
+		return ctx.not_found()
+	}
+	app.revoke_pull_request_approval(pr.id, ctx.user.id) or {
+		ctx.error('Could not revoke approval')
+	}
 	return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 }
 
@@ -458,6 +582,9 @@ pub fn (mut app App) handle_add_line_comment(mut ctx Context, username string, r
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
@@ -466,7 +593,8 @@ pub fn (mut app App) handle_add_line_comment(mut ctx Context, username string, r
 	side := ctx.form['side']
 	line_no := ctx.form['line_number'].int()
 	text := ctx.form['text']
-	if validation.is_string_empty(text) || validation.is_string_empty(file_path) {
+	if !valid_comment(text) || !is_valid_repo_file_path(file_path) || line_no <= 0
+		|| side !in ['left', 'right'] {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}/files')
 	}
 	app.add_pr_review_comment(pr.id, ctx.user.id, 0, file_path, line_no, side, text) or {
@@ -487,7 +615,7 @@ pub fn (mut app App) handle_close_pr(mut ctx Context, username string, repo_name
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	can_close := repo.user_id == ctx.user.id || pr.author_id == ctx.user.id
+	can_close := app.can_admin_repo(ctx, repo) || pr.author_id == ctx.user.id
 	if !can_close {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
@@ -513,16 +641,20 @@ pub fn (mut app App) handle_reopen_pr(mut ctx Context, username string, repo_nam
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	can_reopen := repo.user_id == ctx.user.id || pr.author_id == ctx.user.id
+	can_reopen := app.can_admin_repo(ctx, repo) || pr.author_id == ctx.user.id
 	if !can_reopen {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
 	if !pr.is_closed() {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
-	if !app.contains_repo_branch(repo.id, pr.head_branch)
-		|| !app.contains_repo_branch(repo.id, pr.base_branch) {
+	if !app.contains_repo_branch(repo.id, pr.base_branch)
+		|| (pr.head_repo_id <= 0 && !app.contains_repo_branch(repo.id, pr.head_branch)) {
 		ctx.error('Cannot reopen: head or base branch is missing')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
+	app.refresh_cross_fork_pr_head(repo, pr) or {
+		ctx.error('Cannot reopen: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
 	app.set_pr_status(pr.id, .open) or {
@@ -546,14 +678,22 @@ pub fn (mut app App) handle_merge_pr(mut ctx Context, username string, repo_name
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if repo.user_id != ctx.user.id {
+	if !app.user_can_merge_branch(ctx.user.id, repo, pr.base_branch) {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
 	if !pr.is_open() {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
+	if !app.pull_request_approvals_satisfied(pr, repo) {
+		ctx.error('Merge request approvals are still required')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
+	app.refresh_cross_fork_pr_head(repo, pr) or {
+		ctx.error('Merge failed: ${err}')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
 	merge_message := 'Merge pull request #${pr.id} from ${pr.head_branch}\n\n${pr.title}'
-	merge_hash := merge_branches_in_bare(repo, pr.base_branch, pr.head_branch, ctx.user.username,
+	merge_hash := merge_branches_in_bare(repo, pr.base_branch, pr.head_ref(), ctx.user.username,
 		merge_message) or {
 		ctx.error('Merge failed: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
@@ -578,14 +718,22 @@ pub fn (mut app App) handle_squash_pr(mut ctx Context, username string, repo_nam
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if repo.user_id != ctx.user.id {
+	if !app.user_can_merge_branch(ctx.user.id, repo, pr.base_branch) {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
 	if !pr.is_open() {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
+	if !app.pull_request_approvals_satisfied(pr, repo) {
+		ctx.error('Merge request approvals are still required')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
+	app.refresh_cross_fork_pr_head(repo, pr) or {
+		ctx.error('Squash merge failed: ${err}')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
 	merge_message := 'Squash pull request #${pr.id} from ${pr.head_branch}\n\n${pr.title}'
-	merge_hash := squash_branches_in_bare(repo, pr.base_branch, pr.head_branch, ctx.user.username,
+	merge_hash := squash_branches_in_bare(repo, pr.base_branch, pr.head_ref(), ctx.user.username,
 		merge_message) or {
 		ctx.error('Squash merge failed: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
@@ -620,6 +768,9 @@ pub fn (mut app App) handle_get_user_pulls(mut ctx Context, username string) veb
 	mut prs_with_repo := []PullRequest{}
 	for mut pr in prs {
 		r := app.find_repo_by_id(pr.repo_id) or { continue }
+		if !app.can_read_repo(ctx, r) {
+			continue
+		}
 		pr.repo_author = r.user_name
 		pr.repo_name = r.name
 		prs_with_repo << pr
@@ -815,7 +966,9 @@ fn inline_comments_html(file_path string, dline DiffLine, comments_by_key map[st
 
 // is_safe_ref does a strict whitelist check for branch names used in shell.
 fn is_safe_ref(name string) bool {
-	if name == '' {
+	if name == '' || name.len > 255 || name.starts_with('/') || name.ends_with('/')
+		|| name.starts_with('.') || name.ends_with('.') || name.ends_with('.lock')
+		|| name.contains('//') || name.contains('..') || name.contains('@{') {
 		return false
 	}
 	for ch in name {
@@ -823,8 +976,20 @@ fn is_safe_ref(name string) bool {
 			return false
 		}
 	}
-	if name.starts_with('-') || name.contains('..') {
+	if name.starts_with('-') {
 		return false
+	}
+	return true
+}
+
+fn is_valid_commit_hash(hash string) bool {
+	if hash.len < 4 || hash.len > 64 {
+		return false
+	}
+	for ch in hash.to_lower() {
+		if !ch.is_digit() && (ch < `a` || ch > `f`) {
+			return false
+		}
 	}
 	return true
 }

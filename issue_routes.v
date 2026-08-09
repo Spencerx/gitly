@@ -14,11 +14,11 @@ type CommentWithUser = ItemWithUser[Comment]
 
 @['/api/v1/:username/:repo_name/issues/count']
 fn (mut app App) handle_issues_count(username string, repo_name string) veb.Result {
-	has_access := app.has_user_repo_read_access_by_repo_name(ctx, ctx.user.id, username, repo_name)
-	if !has_access {
+	repo := app.find_repo_by_name_and_username(repo_name, username) or {
 		return ctx.json_error('Not found')
 	}
-	repo := app.find_repo_by_name_and_username(repo_name, username) or {
+	caller := app.api_user_from_ctx(ctx) or { User{} }
+	if !app.user_has_repo_read_access(caller.id, repo) {
 		return ctx.json_error('Not found')
 	}
 	count := app.get_repo_issue_count(repo.id)
@@ -34,6 +34,9 @@ pub fn (mut app App) new_issue(mut ctx Context, username string, repo_name strin
 		return ctx.not_found()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	ctx.set_page_title(['New issue', '${repo.user_name}/${repo.name}'])
 	return $veb.html()
 }
@@ -50,11 +53,13 @@ pub fn (mut app App) handle_add_repo_issue(mut ctx Context, username string, rep
 		return ctx.redirect_to_index()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	title := ctx.form['title']
 	text := ctx.form['text']
-	is_title_empty := validation.is_string_empty(title)
-	is_text_empty := validation.is_string_empty(text)
-	if is_title_empty || is_text_empty {
+	if !valid_title(title) || validation.is_string_empty(text) || !valid_body(text) {
+		ctx.error('Issue title or description is missing or too long')
 		return ctx.redirect('/${username}/${repo_name}/issues/new')
 	}
 	app.increment_user_post(mut ctx.user) or { app.info(err.str()) }
@@ -84,6 +89,9 @@ pub fn (mut app App) handle_get_repo_issues(mut ctx Context, username string, re
 @['/:username/:repo_name/issues/:page']
 pub fn (mut app App) issues(mut ctx Context, username string, repo_name string, page string) veb.Result {
 	mut repo := app.find_repo_by_name_and_username(repo_name, username) or {
+		return ctx.not_found()
+	}
+	if !app.can_read_repo(ctx, repo) {
 		return ctx.not_found()
 	}
 	mut page_i := page.int()
@@ -129,6 +137,9 @@ pub fn (mut app App) issues(mut ctx Context, username string, repo_name string, 
 @['/:username/:repo_name/issue/:id']
 pub fn (mut app App) issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	issue := app.find_issue_by_id(id.int()) or { return ctx.not_found() }
 	if issue.repo_id != repo.id || issue.is_pr {
 		return ctx.not_found()
@@ -177,15 +188,19 @@ pub fn (mut app App) user_issues(mut ctx Context, username string, tab string) v
 		else { app.find_user_issues(user.id) }
 	}
 
-	mut issue_repo := Repo{}
+	mut visible_issues := []Issue{cap: issues.len}
 	for mut issue in issues {
-		issue_repo = app.find_repo_by_id(issue.repo_id) or { continue }
+		issue_repo := app.find_repo_by_id(issue.repo_id) or { continue }
+		if !app.can_read_repo(ctx, issue_repo) {
+			continue
+		}
 		issue.repo_author = issue_repo.user_name
 		issue.repo_name = issue_repo.name
 		issue.labels = app.get_issue_labels(issue.id)
+		visible_issues << issue
 	}
 	mut issues_with_users := []IssueWithUser{}
-	for issue in issues {
+	for issue in visible_issues {
 		issue_author := app.get_user_by_id(issue.author_id) or { placeholder_user(issue.author_id) }
 		issues_with_users << IssueWithUser{
 			item: issue

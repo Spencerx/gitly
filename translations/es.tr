@@ -983,3 +983,195 @@ Público
 user_repo_private
 Privado
 -----
+new_repo_owner
+Propietario
+-----
+new_org_subtitle
+Cuéntanos sobre tu organización
+-----
+new_org_title
+Configura tu organización
+-----
+new_org_name
+Nombre de la organización
+-----
+new_org_name_hint
+Este será el nombre de tu cuenta en Gitly.
+-----
+new_org_url_hint
+Tu URL será:
+-----
+new_org_contact_email
+Correo de contacto
+-----
+new_org_belongs_to
+Esta organización pertenece a:
+-----
+new_org_personal
+Mi cuenta personal
+-----
+new_org_personal_example
+Por ejemplo,
+-----
+new_org_business
+Una empresa o institución
+-----
+new_org_business_example
+Por ejemplo: Acme, Inc., Example Institute, Cruz Roja Americana
+-----
+new_org_accept_terms
+Acepto los Términos de servicio.
+-----
+new_org_next
+Siguiente
+-----
+features_section_title
+Funciones
+-----
+features_section_desc
+Activa o desactiva funciones para este repositorio.
+-----
+save_features
+Guardar funciones
+-----
+wiki
+Wiki
+-----
+header_new_organization
+Nueva organización
+-----
+commit_committed
+confirmó
+-----
+commit_view_patch
+Ver parche
+-----
+commit_files_changed
+archivos modificados
+-----
+commit_additions
+adiciones
+-----
+commit_deletions
+eliminaciones
+-----
+commit_no_changes
+No hay cambios de archivos en este commit.
+-----
+commit_binary_file
+Archivo binario no mostrado.
+-----
+commit_file_new
+archivo nuevo
+-----
+commit_file_deleted
+eliminado
+-----
+commit_file_renamed
+renombrado
+-----
+commits_on
+Commits del
+-----
+browse_repo_at_point
+Explorar el repositorio en este punto
+-----
+about_section
+Acerca de
+-----
+no_description
+Sin descripción.
+-----
+readme_link
+Readme
+-----
+license_link
+Licencia
+-----
+stars_label
+estrellas
+-----
+watching_label
+siguiendo
+-----
+sponsor_section
+Patrocina este proyecto
+-----
+sponsor_action
+Patrocinar
+-----
+releases_section
+Versiones
+-----
+contributors_section
+Colaboradores
+-----
+latest_label
+Última
+-----
+releases_more
+versiones más
+-----
+no_releases
+No hay versiones publicadas
+-----
+no_contributors
+Aún no hay colaboradores
+-----
+star_action
+Destacar
+-----
+starred
+Destacado
+-----
+watch_action
+Seguir
+-----
+unwatch_action
+Dejar de seguir
+-----
+user_edit_profile
+Editar perfil
+-----
+user_pinned_repos
+Repositorios fijados
+-----
+user_view_all_repos
+Ver todos
+-----
+user_no_repos
+Aún no hay repositorios.
+-----
+user_contributions_in_year
+contribuciones en el último año
+-----
+user_commits_label
+commits
+-----
+user_heatmap_less
+Menos
+-----
+user_heatmap_more
+Más
+-----
+user_contribution_activity
+Actividad de contribución
+-----
+user_activity_joined
+Se unió a Gitly
+-----
+user_activity_first_repo
+Primer repositorio
+-----
+user_activity_first_issue
+Primer issue
+-----
+user_activity_on
+el
+-----
+login_via_github
+Iniciar sesión con GitHub
+-----
+register_via_github
+Registrarse con GitHub
+-----

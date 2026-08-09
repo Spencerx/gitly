@@ -35,7 +35,8 @@ fn (mut app App) verify_pending_2fa(token string) ?User {
 	user := app.get_user_by_id(user_id) or { return none }
 	payload := '${user_id}:${expires}'
 	expected := hmac.new(app.pending_2fa_key(user), payload.bytes(), sha256.sum, sha256.block_size)
-	if hex.encode(expected) != sig {
+	provided := hex.decode(sig) or { return none }
+	if !hmac.equal(expected, provided) {
 		return none
 	}
 	return user
@@ -57,7 +58,15 @@ pub fn (mut app App) handle_two_factor_login(mut ctx Context, code string) veb.R
 		ctx.error('Invalid verification code')
 		return $veb.html('templates/two_factor_login.html')
 	}
-	ctx.set_cookie(name: two_factor_pending_cookie, value: '')
+	ctx.set_cookie(
+		name:      two_factor_pending_cookie
+		value:     ''
+		path:      '/'
+		max_age:   -1
+		http_only: true
+		same_site: .same_site_strict_mode
+		secure:    app.config.cookie_secure
+	)
 	app.auth_user(mut ctx, user, ctx.ip()) or {
 		ctx.error('There was an error while logging in')
 		return ctx.redirect_to_login()
@@ -80,7 +89,13 @@ pub fn (mut app App) view_two_factor_settings(mut ctx Context, username string) 
 	mut secret := ''
 	mut provisioning_uri := ''
 	if !enabled {
-		secret = if tf.secret == '' { generate_totp_secret() } else { tf.secret }
+		secret = if tf.secret == '' {
+			generate_totp_secret() or {
+				return ctx.server_error('Could not generate a secure two-factor secret')
+			}
+		} else {
+			tf.secret
+		}
 		app.upsert_two_factor(ctx.user.id, secret, false) or {}
 		provisioning_uri = totp_provisioning_uri(username, secret)
 	}

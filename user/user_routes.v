@@ -3,13 +3,29 @@ module main
 import time
 import os
 import veb
-import rand
+import crypto.rand as crypto_rand
+import encoding.hex
 import validation
 import api
 
+fn (mut app App) new_oauth_state(mut ctx Context) !string {
+	state := hex.encode(crypto_rand.bytes(32)!)
+	ctx.set_cookie(
+		name:      'csrf'
+		value:     state
+		path:      '/'
+		max_age:   600
+		http_only: true
+		same_site: .same_site_lax_mode
+		secure:    app.config.cookie_secure
+	)
+	return state
+}
+
 pub fn (mut app App) login(mut ctx Context) veb.Result {
-	csrf := rand.string(30)
-	ctx.set_cookie(name: 'csrf', value: csrf)
+	csrf := app.new_oauth_state(mut ctx) or {
+		return ctx.server_error('Could not create a secure OAuth state')
+	}
 
 	if app.is_logged_in(mut ctx) {
 		return ctx.redirect('/' + ctx.user.username)
@@ -20,10 +36,13 @@ pub fn (mut app App) login(mut ctx Context) veb.Result {
 
 @['/login'; post]
 pub fn (mut app App) handle_login(mut ctx Context, username string, password string) veb.Result {
-	if username == '' || password == '' {
+	if username == '' || password == '' || username.len > max_username_len
+		|| password.len > max_password_len {
 		return ctx.redirect_to_login()
 	}
-	user := app.get_user_by_username(username) or { return ctx.redirect_to_login() }
+	user := app.get_user_by_username(username) or {
+		app.get_user_by_username(username.to_lower()) or { return ctx.redirect_to_login() }
+	}
 	if user.is_blocked {
 		return ctx.redirect_to_login()
 	}
@@ -48,7 +67,15 @@ pub fn (mut app App) handle_login(mut ctx Context, username string, password str
 	if app.user_has_two_factor(user.id) {
 		expires := time.now().unix() + two_factor_pending_ttl
 		token := app.sign_pending_2fa(user, expires)
-		ctx.set_cookie(name: two_factor_pending_cookie, value: token, path: '/')
+		ctx.set_cookie(
+			name:      two_factor_pending_cookie
+			value:     token
+			path:      '/'
+			max_age:   two_factor_pending_ttl
+			http_only: true
+			same_site: .same_site_strict_mode
+			secure:    app.config.cookie_secure
+		)
 		return ctx.redirect('/login/2fa')
 	}
 	app.auth_user(mut ctx, user, ctx.ip()) or {
@@ -56,12 +83,22 @@ pub fn (mut app App) handle_login(mut ctx Context, username string, password str
 		return app.login(mut ctx)
 	}
 	app.add_security_log(user_id: user.id, kind: .logged_in) or { app.info(err.str()) }
-	return ctx.redirect('/${username}')
+	return ctx.redirect('/${user.username}')
 }
 
-@['/logout']
+@['/logout'; post]
 pub fn (mut app App) handle_logout(mut ctx Context) veb.Result {
-	ctx.set_cookie(name: 'token', value: '')
+	token := ctx.get_cookie('token') or { '' }
+	app.delete_token(token) or { app.info('failed to delete session on logout: ${err}') }
+	ctx.set_cookie(
+		name:      'token'
+		value:     ''
+		path:      '/'
+		max_age:   -1
+		http_only: true
+		same_site: .same_site_lax_mode
+		secure:    app.config.cookie_secure
+	)
 	return ctx.redirect_to_index()
 }
 
@@ -69,7 +106,8 @@ pub fn (mut app App) handle_logout(mut ctx Context) veb.Result {
 pub fn (mut app App) user(mut ctx Context, username string) veb.Result {
 	exists, user := app.check_username(username)
 	if !exists {
-		return ctx.not_found()
+		org := app.get_org_by_name(username) or { return ctx.not_found() }
+		return app.organization(mut ctx, org.name)
 	}
 	is_page_owner := username == ctx.user.username
 	mut repos := app.find_user_profile_repos(user.id, is_page_owner)
@@ -117,8 +155,12 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 	}
 
 	// TODO: uneven parameters count (2) in `handle_update_user_settings`, compared to the vweb route `['/:user/settings', 'post']` (1)
-	new_username := ctx.form['name']
-	full_name := ctx.form['full_name']
+	new_username := ctx.form['name'].trim_space().to_lower()
+	full_name := ctx.form['full_name'].trim_space()
+	if full_name.len > max_short_name_len {
+		ctx.error('Full name is too long')
+		return app.user_settings(mut ctx, username)
+	}
 
 	is_username_empty := validation.is_string_empty(new_username)
 
@@ -128,7 +170,7 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 		return app.user_settings(mut ctx, username)
 	}
 
-	if ctx.user.namechanges_count > max_namechanges {
+	if ctx.user.namechanges_count >= max_namechanges {
 		ctx.error('You can not change your username, limit reached')
 
 		return app.user_settings(mut ctx, username)
@@ -139,6 +181,14 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 	if !is_username_valid {
 		ctx.error('New username is not valid')
 
+		return app.user_settings(mut ctx, username)
+	}
+	if is_reserved_account_name(new_username) {
+		ctx.error('New username is reserved')
+		return app.user_settings(mut ctx, username)
+	}
+	if _ := app.get_org_by_name(new_username) {
+		ctx.error('Name already exists')
 		return app.user_settings(mut ctx, username)
 	}
 
@@ -170,7 +220,12 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 			return app.user_settings(mut ctx, username)
 		}
 
-		app.change_username(ctx.user.id, new_username) or {
+		app.rename_user_directory(username, new_username) or {
+			ctx.error('There was an error while moving your repositories')
+			return app.user_settings(mut ctx, username)
+		}
+		app.change_username(ctx.user.id, username, new_username) or {
+			app.rename_user_directory(new_username, username) or {}
 			ctx.error('There was an error while updating the settings')
 			return app.user_settings(mut ctx, username)
 		}
@@ -178,23 +233,30 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 			ctx.error('There was an error while updating the settings')
 			return app.user_settings(mut ctx, username)
 		}
-		app.rename_user_directory(username, new_username)
 	}
 
 	return ctx.redirect('/${new_username}')
 }
 
-fn (mut app App) rename_user_directory(old_name string, new_name string) {
-	os.mv('${app.config.repo_storage_path}/${old_name}',
-		'${app.config.repo_storage_path}/${new_name}') or { panic(err) }
+fn (mut app App) rename_user_directory(old_name string, new_name string) ! {
+	old_path := os.join_path(app.config.repo_storage_path, old_name)
+	new_path := os.join_path(app.config.repo_storage_path, new_name)
+	if !os.exists(old_path) {
+		return
+	}
+	if os.exists(new_path) {
+		return error('destination repository directory already exists')
+	}
+	os.mv(old_path, new_path)!
 }
 
 pub fn (mut app App) register(mut ctx Context) veb.Result {
 	if ctx.logged_in {
 		return ctx.redirect('/${ctx.user.username}')
 	}
-	csrf := rand.string(30)
-	ctx.set_cookie(name: 'csrf', value: csrf)
+	csrf := app.new_oauth_state(mut ctx) or {
+		return ctx.server_error('Could not create a secure OAuth state')
+	}
 
 	user_count := app.get_users_count_with_reconnect() or { return ctx.db_error(err) }
 	no_users := user_count == 0
@@ -220,20 +282,25 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 		return app.register_failed(mut ctx, no_redirect, 'Failed to register: ${err}')
 	}
 	no_users := user_count == 0
-	println('USERNAME=${username}')
-
-	if username in ['login', 'register', 'new', 'new_post', 'oauth'] {
-		return app.register_failed(mut ctx, no_redirect, 'Username `${username}` is not available')
+	clean_username := username.trim_space().to_lower()
+	clean_email := email.trim_space().to_lower()
+	if clean_username == '' || clean_email == '' {
+		return app.register_failed(mut ctx, no_redirect, 'Username or email cannot be empty')
 	}
 
-	user_chars := username.bytes()
+	if is_reserved_account_name(clean_username) {
+		return app.register_failed(mut ctx, no_redirect,
+			'Username `${clean_username}` is not available')
+	}
+
+	user_chars := clean_username.bytes()
 
 	if user_chars.len > max_username_len {
 		return app.register_failed(mut ctx, no_redirect,
 			'Username is too long (max. ${max_username_len})')
 	}
 
-	if username.contains('--') {
+	if clean_username.contains('--') {
 		return app.register_failed(mut ctx, no_redirect, 'Username cannot contain two hyphens')
 	}
 
@@ -243,34 +310,43 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 	}
 
 	for ch in user_chars {
-		if !ch.is_letter() && !ch.is_digit() && ch != `-` {
+		if !ch.is_letter() && !ch.is_digit() && ch !in [`-`, `_`, `.`] {
 			return app.register_failed(mut ctx, no_redirect,
 				'Username cannot contain special characters')
 		}
 	}
 
-	is_username_valid := validation.is_username_valid(username)
+	is_username_valid := validation.is_username_valid(clean_username)
 
 	if !is_username_valid {
 		return app.register_failed(mut ctx, no_redirect, 'Username is not valid')
 	}
 
-	if password == '' {
-		return app.register_failed(mut ctx, no_redirect, 'Password cannot be empty')
+	if password.len < 8 || password.len > max_password_len {
+		return app.register_failed(mut ctx, no_redirect,
+			'Password must contain between 8 and ${max_password_len} characters')
+	}
+	if !validation.is_email_valid(clean_email) {
+		return app.register_failed(mut ctx, no_redirect, 'Email address is not valid')
+	}
+	if _ := app.get_org_by_name(clean_username) {
+		return app.register_failed(mut ctx, no_redirect,
+			'Username `${clean_username}` is not available')
 	}
 
 	salt := generate_salt()
 	hashed_password := hash_password_with_salt(password, salt)
-
-	if username == '' || email == '' {
-		return app.register_failed(mut ctx, no_redirect, 'Username or Email cannot be emtpy')
+	if hashed_password == '' {
+		return app.register_failed(mut ctx, no_redirect, 'Could not securely hash password')
 	}
 
 	// TODO: refactor
-	is_registered := app.register_user(username, hashed_password, salt, [email], false, no_users) or {
-		eprintln('[register] register_user failed for username=${username} email=${email}: ${err}')
+	is_registered := app.register_user(clean_username, hashed_password, salt, [
+		clean_email,
+	], false, no_users) or {
+		eprintln('[register] register_user failed for username=${clean_username}: ${err}')
 		msg := if is_unique_constraint_error(err) {
-			'Username `${username}` or email `${email}` is already in use'
+			'Username `${clean_username}` or email `${clean_email}` is already in use'
 		} else {
 			'Failed to register: ${err.msg()}'
 		}
@@ -278,12 +354,12 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 	}
 
 	if !is_registered {
-		eprintln('[register] register_user returned false for username=${username} email=${email} (user already exists or insertion mismatch — see prior info logs)')
+		eprintln('[register] register_user returned false for username=${clean_username}')
 		return app.register_failed(mut ctx, no_redirect,
 			'Failed to register: user already exists or could not be inserted')
 	}
 
-	user := app.get_user_by_username(username) or {
+	user := app.get_user_by_username(clean_username) or {
 		return app.register_failed(mut ctx, no_redirect, 'User already exists')
 	}
 
@@ -291,10 +367,10 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 		app.add_admin(user.id) or { app.info(err.str()) }
 	}
 
-	client_ip := 'ip' // ctx.ip() // XTODO
+	client_ip := ctx.ip()
 
 	app.auth_user(mut ctx, user, client_ip) or {
-		eprintln('[register] auth_user failed for username=${username}: ${err}')
+		eprintln('[register] auth_user failed for username=${clean_username}: ${err}')
 		return app.register_failed(mut ctx, no_redirect, 'Failed to register: ${err}')
 	}
 	app.add_security_log(user_id: user.id, kind: .registered) or { app.info(err.str()) }
@@ -303,7 +379,13 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 		return ctx.text('ok')
 	}
 
-	return ctx.redirect('/' + username)
+	return ctx.redirect('/' + clean_username)
+}
+
+fn is_reserved_account_name(name string) bool {
+	return name.to_lower() in ['admin', 'api', 'assets', 'change_lang', 'css', 'favicon.ico', 'js',
+		'login', 'logout', 'new', 'new_post', 'oauth', 'open-source', 'organizations', 'pricing',
+		'register', 'search', 'settings']
 }
 
 @['/api/v1/users/avatar'; post]
@@ -312,11 +394,18 @@ pub fn (mut app App) handle_upload_avatar(mut ctx Context) veb.Result {
 		return ctx.not_found()
 	}
 
+	if 'file' !in ctx.files || ctx.files['file'].len == 0 {
+		ctx.res.set_status(.bad_request)
+		return ctx.json(api.ApiErrorResponse{
+			message: 'No avatar file was provided'
+		})
+	}
 	avatar := ctx.files['file'].first()
 	file_content_type := avatar.content_type
 	file_content := avatar.data
 
 	file_extension := extract_file_extension_from_mime_type(file_content_type) or {
+		ctx.res.set_status(.bad_request)
 		response := api.ApiErrorResponse{
 			message: err.str()
 		}
@@ -327,18 +416,31 @@ pub fn (mut app App) handle_upload_avatar(mut ctx Context) veb.Result {
 	is_content_size_valid := validate_avatar_file_size(file_content)
 
 	if !is_content_size_valid {
+		ctx.res.set_status(.request_entity_too_large)
 		response := api.ApiErrorResponse{
 			message: 'This file is too large to be uploaded'
 		}
 
 		return ctx.json(response)
 	}
+	if !validate_avatar_content(file_content_type, file_content) {
+		ctx.res.set_status(.bad_request)
+		return ctx.json(api.ApiErrorResponse{
+			message: 'The uploaded file does not match its image type'
+		})
+	}
 
 	username := ctx.user.username
 	avatar_filename := '${username}.${file_extension}'
 
-	app.write_user_avatar(avatar_filename, file_content)
+	if !app.write_user_avatar(avatar_filename, file_content) {
+		ctx.res.set_status(.internal_server_error)
+		return ctx.json(api.ApiErrorResponse{
+			message: 'There was an error while saving the avatar'
+		})
+	}
 	app.update_user_avatar(ctx.user.id, avatar_filename) or {
+		ctx.res.set_status(.internal_server_error)
 		response := api.ApiErrorResponse{
 			message: 'There was an error while updating the avatar'
 		}
@@ -349,7 +451,9 @@ pub fn (mut app App) handle_upload_avatar(mut ctx Context) veb.Result {
 	avatar_file_path := app.build_avatar_file_path(avatar_filename)
 	avatar_file_url := app.build_avatar_file_url(avatar_filename)
 
-	app.serve_static(avatar_file_url, avatar_file_path) or { panic(err) }
+	app.serve_static(avatar_file_url, avatar_file_path) or {
+		app.info('failed to register avatar static path: ${err}')
+	}
 
 	response := api.ApiResponse{
 		success: true

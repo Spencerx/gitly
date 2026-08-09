@@ -102,6 +102,16 @@ fn (mut app App) get_discussion_comments(discussion_id int) []DiscussionComment 
 	} or { []DiscussionComment{} }
 }
 
+fn (mut app App) find_discussion_comment(id int) ?DiscussionComment {
+	rows := sql app.db {
+		select from DiscussionComment where id == id limit 1
+	} or { []DiscussionComment{} }
+	if rows.len == 0 {
+		return none
+	}
+	return rows.first()
+}
+
 fn (mut app App) set_discussion_lock(discussion_id int, locked bool) ! {
 	sql app.db {
 		update Discussion set is_locked = locked where id == discussion_id

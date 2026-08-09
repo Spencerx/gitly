@@ -15,7 +15,6 @@ struct Repo {
 	name               string
 	user_id            int
 	user_name          string
-	clone_url          string @[skip]
 	description        string
 	is_public          bool
 	is_deleted         bool
@@ -26,6 +25,7 @@ struct Repo {
 	latest_update_hash string    @[skip]
 	latest_activity    time.Time @[skip]
 mut:
+	clone_url           string @[skip]
 	primary_branch      string
 	webhook_secret      string
 	tags_count          int
@@ -48,6 +48,7 @@ mut:
 	disable_milestones  bool
 	disable_wiki        bool
 	is_pinned           bool
+	required_approvals  int
 }
 
 fn (r &Repo) discussions_enabled() bool {
@@ -67,8 +68,8 @@ fn (r &Repo) wiki_enabled() bool {
 }
 
 // log_field_separator is declared as constant in case we need to change it later
-const max_git_res_size = 1000
 const max_free_clone_size_bytes = u64(100) * 1024 * 1024
+const search_results_limit = 50
 const log_field_separator = '\x7F'
 const ignored_folder = ['thirdparty']
 
@@ -151,20 +152,27 @@ fn (app App) find_repo_by_name_and_username(repo_name string, username string) ?
 }
 
 fn (mut app App) get_count_user_repos(user_id int) int {
+	user := app.get_user_by_id(user_id) or { return 0 }
+	username := user.username
 	return sql app.db {
-		select count from Repo where user_id == user_id && is_deleted == false
+		select count from Repo where user_id == user_id && user_name == username && is_deleted == false
 	} or { 0 }
 }
 
 fn (mut app App) find_user_repos(user_id int) []Repo {
+	user := app.get_user_by_id(user_id) or { return [] }
+	username := user.username
 	return sql app.db {
-		select from Repo where user_id == user_id && is_deleted == false
+		select from Repo where user_id == user_id && user_name == username && is_deleted == false
 	} or { []Repo{} }
 }
 
 fn (mut app App) find_user_public_repos(user_id int) []Repo {
+	user := app.get_user_by_id(user_id) or { return [] }
+	username := user.username
 	return sql app.db {
-		select from Repo where user_id == user_id && is_public == true && is_deleted == false
+		select from Repo where user_id == user_id && user_name == username && is_public == true
+		&& is_deleted == false
 	} or { []Repo{} }
 }
 
@@ -172,25 +180,31 @@ const profile_repos_limit = 6
 
 fn (mut app App) find_user_pinned_repos(user_id int, include_private bool) []Repo {
 	limit := profile_repos_limit
+	user := app.get_user_by_id(user_id) or { return [] }
+	username := user.username
 	if include_private {
 		return sql app.db {
-			select from Repo where user_id == user_id && is_pinned == true && is_deleted == false limit limit
+			select from Repo where user_id == user_id && user_name == username && is_pinned == true
+			&& is_deleted == false limit limit
 		} or { []Repo{} }
 	}
 	return sql app.db {
-		select from Repo where user_id == user_id && is_pinned == true && is_public == true
-		&& is_deleted == false limit limit
+		select from Repo where user_id == user_id && user_name == username && is_pinned == true
+		&& is_public == true && is_deleted == false limit limit
 	} or { []Repo{} }
 }
 
 fn (mut app App) find_user_top_repos_by_stars(user_id int, include_private bool, l int) []Repo {
+	user := app.get_user_by_id(user_id) or { return [] }
+	username := user.username
 	if include_private {
 		return sql app.db {
-			select from Repo where user_id == user_id && is_deleted == false order by nr_stars desc limit l
+			select from Repo where user_id == user_id && user_name == username && is_deleted == false order by nr_stars desc limit l
 		} or { []Repo{} }
 	}
 	return sql app.db {
-		select from Repo where user_id == user_id && is_public == true && is_deleted == false order by nr_stars desc limit l
+		select from Repo where user_id == user_id && user_name == username && is_public == true
+		&& is_deleted == false order by nr_stars desc limit l
 	} or { []Repo{} }
 }
 
@@ -204,20 +218,17 @@ fn (mut app App) find_user_profile_repos(user_id int, include_private bool) []Re
 
 fn (mut app App) search_public_repos(query string) []Repo {
 	repo_rows := db_exec_values(mut app.db,
-		'select id, name, user_id, description, stars_count from ${sql_table('Repo')} where is_public is true and is_deleted is false and name like ${sql_like_pattern(query)}') or {
+		'select id, name, user_name, description, stars_count from ${sql_table('Repo')} where is_public is true and is_deleted is false and name like ${sql_like_pattern(query)} limit ${search_results_limit}') or {
 		return []
 	}
 
 	mut repos := []Repo{}
 
 	for row in repo_rows {
-		user_id := row[2].int()
-		user := app.get_user_by_id(user_id) or { User{} }
-
 		repos << Repo{
 			id:          row[0].int()
 			name:        row[1]
-			user_name:   user.username
+			user_name:   row[2]
 			description: row[3]
 			nr_stars:    row[4].int()
 		}
@@ -336,16 +347,19 @@ fn (mut app App) increment_file_views(file_id int) ! {
 	}!
 }
 
-fn (mut app App) set_repo_webhook_secret(repo_id int, secret string) ! {
-	sql app.db {
-		update Repo set webhook_secret = secret where id == repo_id
-	}!
-}
-
 fn (mut app App) update_repo_features(repo_id int, disable_discussions bool, disable_projects bool, disable_milestones bool, disable_wiki bool) ! {
 	sql app.db {
 		update Repo set disable_discussions = disable_discussions, disable_projects = disable_projects,
 		disable_milestones = disable_milestones, disable_wiki = disable_wiki where id == repo_id
+	}!
+}
+
+fn (mut app App) set_repo_required_approvals(repo_id int, required int) ! {
+	if repo_id <= 0 || required < 0 || required > 100 {
+		return error('required approvals must be between 0 and 100')
+	}
+	sql app.db {
+		update Repo set required_approvals = required where id == repo_id
 	}!
 }
 
@@ -453,6 +467,12 @@ fn (r &Repo) last_activity_at() int {
 }
 
 fn (mut app App) delete_repository(id int, path string, name string) ! {
+	app.delete_repo_transfer_for_repo(id)!
+	app.delete_repo_fork_relationships(id)!
+	app.delete_repo_mirrors(id)!
+	app.delete_repo_project_members(id)!
+	app.delete_repo_protected_branches(id)!
+	app.delete_repo_deploy_keys(id)!
 	sql app.db {
 		update Repo set is_deleted = true where id == id
 	}!
@@ -462,15 +482,34 @@ fn (mut app App) delete_repository(id int, path string, name string) ! {
 	app.info('Removed repo folder (${id}, ${name})')
 }
 
-fn (mut app App) move_repo_to_user(repo_id int, user_id int, user_name string) ! {
+fn (mut app App) move_repo_to_user(repo Repo, dest_user User) ! {
+	dest_dir := os.join_path(app.config.repo_storage_path, dest_user.username)
+	if !os.exists(dest_dir) {
+		os.mkdir(dest_dir)!
+	}
+	dest_path := os.join_path(dest_dir, repo.name)
+	if os.exists(dest_path) {
+		return error('destination repository directory already exists')
+	}
+	os.mv(repo.git_dir, dest_path)!
+	id := repo.id
+	user_id := dest_user.id
+	user_name := dest_user.username
+	git_dir := dest_path
 	sql app.db {
-		update Repo set user_id = user_id, user_name = user_name where id == repo_id
-	}!
+		update Repo set user_id = user_id, user_name = user_name, git_dir = git_dir where id == id
+	} or {
+		os.mv(dest_path, repo.git_dir) or {}
+		return err
+	}
 }
 
 fn (mut app App) user_has_repo(user_id int, repo_name string) bool {
+	user := app.get_user_by_id(user_id) or { return false }
+	username := user.username
 	count := sql app.db {
-		select count from Repo where user_id == user_id && name == repo_name && is_deleted == false
+		select count from Repo where user_id == user_id && user_name == username && name == repo_name
+		&& is_deleted == false
 	} or { 0 }
 	return count > 0
 }
@@ -676,6 +715,26 @@ fn (mut app App) update_repo_after_push(repo_id int, branch_name string) ! {
 
 	app.update_repo_from_fs(mut repo, false)!
 	app.delete_repository_files_in_branch(repo_id, branch_name)!
+	app.clear_open_pr_approvals_for_head(repo_id, branch_name)!
+}
+
+fn (mut app App) update_repo_after_ref_changes(repo_id int, updates []git.GitRefUpdate) ! {
+	mut repo := app.find_repo_by_id(repo_id) or { return }
+	app.update_repo_from_fs(mut repo, false)!
+	mut seen := map[string]bool{}
+	for update in updates {
+		branch := update.branch_name() or { continue }
+		if seen[branch] {
+			continue
+		}
+		seen[branch] = true
+		app.delete_repository_files_in_branch(repo_id, branch)!
+		app.clear_open_pr_approvals_for_head(repo_id, branch)!
+		if update.is_delete() {
+			app.delete_repo_branch_by_name(repo_id, branch)!
+		}
+	}
+	app.sync_repo_branch_count(repo_id)!
 }
 
 // bg_recompute_lang_stats recomputes language statistics for a repo in a
@@ -1153,26 +1212,44 @@ fn (r Repo) git_advertise(service string) string {
 }
 
 fn (r Repo) archive_tag(tag string, path string, format ArchiveFormat) {
-	// TODO: check tag name before running command
-	r.git('archive ${tag} --format=${format} --output="${path}"')
+	if !is_safe_ref(tag) {
+		return
+	}
+	result := git.Git.exec_in_dir(r.git_dir, ['archive', tag, '--format=${format}',
+		'--output=${path}'])
+	if result.exit_code != 0 {
+		eprintln('git archive error: ${result.output}')
+	}
 }
 
 fn (r Repo) get_commit_patch(commit_hash string) ?string {
-	patch := r.git('format-patch --stdout -1 ${commit_hash}')
-
-	if patch == '' {
+	if !is_valid_commit_hash(commit_hash) {
 		return none
 	}
-
-	return patch
+	result := git.Git.exec_in_dir(r.git_dir, ['format-patch', '--stdout', '-1', commit_hash])
+	if result.exit_code != 0 || result.output == '' {
+		return none
+	}
+	return result.output
 }
 
 fn (r Repo) git_smart(service string, input string) string {
+	return r.git_smart_with_env(service, input, map[string]string{})
+}
+
+fn (r Repo) git_smart_with_env(service string, input string, extra_env map[string]string) string {
 	git_path := git.get_git_executable_path() or { 'git' }
 	real_repository_path := os.real_path(r.git_dir)
 
 	mut process := os.new_process(git_path)
 	process.set_args([service, '--stateless-rpc', real_repository_path])
+	if extra_env.len > 0 {
+		mut environment := os.environ()
+		for key, value in extra_env {
+			environment[key] = value
+		}
+		process.set_environment(environment)
+	}
 
 	process.set_redirect_stdio()
 	process.run()
@@ -1200,6 +1277,25 @@ fn (mut app App) generate_clone_url(repo Repo) string {
 	repo_name := repo.name
 
 	return 'https://${hostname}/${username}/${repo_name}.git'
+}
+
+fn (app &App) generate_ssh_clone_url(repo Repo) string {
+	hostname := if app.config.ssh_hostname.trim_space() != '' {
+		app.config.ssh_hostname.trim_space()
+	} else {
+		app.config.hostname.trim_space()
+	}
+	port := if app.config.ssh_port > 0 { app.config.ssh_port } else { 22 }
+	user := if app.config.ssh_user.trim_space() != '' {
+		app.config.ssh_user.trim_space()
+	} else {
+		'git'
+	}
+	return if port == 22 {
+		'${user}@${hostname}:${repo.user_name}/${repo.name}.git'
+	} else {
+		'ssh://${user}@${hostname}:${port}/${repo.user_name}/${repo.name}.git'
+	}
 }
 
 fn first_line(s string) string {
@@ -1234,6 +1330,7 @@ fn (mut app App) update_repo_primary_branch(repo_id int, branch string) ! {
 	sql app.db {
 		update Repo set primary_branch = branch where id == repo_id
 	}!
+	app.ensure_default_branch_protection(repo_id, branch)!
 }
 
 fn (r &Repo) clone_progress_path() string {
@@ -1496,7 +1593,7 @@ fn (app &App) can_read_repo(ctx Context, repo Repo) bool {
 	if repo.is_public {
 		return true
 	}
-	return ctx.logged_in && ctx.user.id != 0 && repo.user_id == ctx.user.id
+	return ctx.logged_in && app.user_has_repo_read_access(ctx.user.id, repo)
 }
 
 fn (app &App) has_user_repo_read_access(ctx Context, user_id int, repo_id int) bool {
@@ -1504,20 +1601,23 @@ fn (app &App) has_user_repo_read_access(ctx Context, user_id int, repo_id int) b
 		return false
 	}
 	repo := app.find_repo_by_id(repo_id) or { return false }
+	return app.user_has_repo_read_access(user_id, repo)
+}
+
+fn (app &App) user_has_repo_read_access(user_id int, repo Repo) bool {
 	if repo.is_public {
 		return true
 	}
-	is_repo_owner := repo.user_id == user_id
-	if is_repo_owner {
-		return true
-	}
-	return false
+	return app.repo_access_level(user_id, repo) >= project_access_reporter
 }
 
 fn (app &App) has_user_repo_read_access_by_repo_name(ctx Context, user_id int, repo_owner_name string, repo_name string) bool {
-	user := app.get_user_by_username(repo_owner_name) or { return false }
-	repo := app.find_repo_by_name_and_user_id(repo_name, user.id) or { return false }
+	repo := app.find_repo_by_name_and_username(repo_name, repo_owner_name) or { return false }
 	return app.has_user_repo_read_access(ctx, user_id, repo.id)
+}
+
+fn (app &App) user_can_write_repo(user_id int, repo Repo) bool {
+	return app.repo_access_level(user_id, repo) >= project_access_developer
 }
 
 // can_admin_repo reports whether the currently logged-in user is allowed to
@@ -1526,5 +1626,5 @@ fn (app &App) has_user_repo_read_access_by_repo_name(ctx Context, user_id int, r
 // re-queried by the logged-in user's name — otherwise a user could pass the
 // check for someone else's repo simply by owning a repo with the same name.
 fn (app &App) can_admin_repo(ctx Context, repo Repo) bool {
-	return ctx.logged_in && ctx.user.id != 0 && repo.user_id == ctx.user.id
+	return ctx.logged_in && app.repo_access_level(ctx.user.id, repo) >= project_access_maintainer
 }

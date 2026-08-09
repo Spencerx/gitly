@@ -1,7 +1,6 @@
 module main
 
 import x.json2 as json
-import net.http
 import os
 import git
 
@@ -59,6 +58,10 @@ fn (mut app App) trigger_ci_with_config(repo_id int, branch_name string, yaml_co
 fn (mut app App) send_ci_trigger(repo Repo, branch_name string, yaml_config string) {
 	// Get the latest commit hash for this branch
 	commit_hash := repo.get_last_branch_commit_hash(branch_name)
+	if !is_valid_commit_hash(commit_hash) || !is_safe_ref(branch_name) {
+		app.warn('Refusing to trigger CI for an invalid branch or commit')
+		return
+	}
 
 	// Build callback URL
 	callback_url := 'http://localhost:${app.port}/api/v1/ci/status'
@@ -81,11 +84,12 @@ fn (mut app App) send_ci_trigger(repo Repo, branch_name string, yaml_config stri
 	}
 
 	// Trigger CI service
-	ci_url := '${app.config.ci_service_url}/api/v1/trigger'
-	app.info('Posting CI trigger to ${ci_url}')
+	path := '/api/v1/trigger'
+	app.info('Posting CI trigger to ${app.config.ci_service_url}${path}')
 
-	response := http.post_json(ci_url, payload) or {
+	response := app.ci_service_request(.post, path, payload) or {
 		app.warn('Failed to trigger CI: ${err}')
+		app.upsert_ci_status(repo.id, commit_hash, branch_name, .failure, 0) or {}
 		return
 	}
 
