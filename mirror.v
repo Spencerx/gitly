@@ -111,12 +111,29 @@ fn normalize_mirror_endpoint(raw string, allowed_hosts []string) !(string, strin
 		endpoint.user = none
 	} else if password != '' {
 		return error('Passwords in SSH mirror URLs are not supported; use a private key')
+	} else if !valid_ssh_mirror_username(username) {
+		return error('The SSH mirror username is invalid')
 	}
 	clean := endpoint.str()
 	if clean.len > max_clone_url_len || !is_safe_mirror_endpoint(clean, allowed_hosts) {
 		return error('The mirror destination is not an allowed Git server')
 	}
 	return clean, username, password, scheme
+}
+
+fn valid_ssh_mirror_username(username string) bool {
+	if username == '' {
+		return true
+	}
+	if username.len > 255 || username.starts_with('-') || username.contains_any('\x00\r\n\t @/\\') {
+		return false
+	}
+	for ch in username.bytes() {
+		if ch < 0x20 || ch == 0x7f {
+			return false
+		}
+	}
+	return true
 }
 
 fn encrypt_mirror_secret(storage_secret string, value string) !string {
@@ -179,7 +196,7 @@ fn (app &App) find_repo_mirror(id int) ?RepoMirror {
 
 fn (mut app App) add_repo_mirror(repo_id int, created_by int, raw_url string, form_username string,
 	form_password string, ssh_private_key string, ssh_known_hosts string, direction string,
-	overwrite_diverged bool, only_protected bool, interval_minutes int) ! {
+	overwrite_diverged bool, only_protected bool, interval_minutes int) !int {
 	if repo_id <= 0 || created_by <= 0 || !valid_mirror_direction(direction) {
 		return error('Invalid repository mirror')
 	}
@@ -194,6 +211,9 @@ fn (mut app App) add_repo_mirror(repo_id int, created_by int, raw_url string, fo
 		return error('SSH mirror credentials are too long')
 	}
 	if scheme == 'ssh' {
+		if !valid_ssh_mirror_username(username) {
+			return error('The SSH mirror username is invalid')
+		}
 		if ssh_known_hosts.trim_space() == '' {
 			return error('SSH mirrors require a pinned known_hosts entry')
 		}
@@ -211,25 +231,29 @@ fn (mut app App) add_repo_mirror(repo_id int, created_by int, raw_url string, fo
 		interval_minutes
 	}
 	now := int(time.now().unix())
-	row := RepoMirror{
-		repo_id:            repo_id
-		created_by:         created_by
-		direction:          direction
-		url:                clean_url
-		encrypted_username: encrypt_mirror_secret(app.config.storage_secret, username)!
-		encrypted_password: encrypt_mirror_secret(app.config.storage_secret, password)!
-		encrypted_ssh_key:  encrypt_mirror_secret(app.config.storage_secret, ssh_private_key)!
-		ssh_known_hosts:    ssh_known_hosts.trim_space()
-		enabled:            true
-		overwrite_diverged: overwrite_diverged
-		only_protected:     only_protected
-		interval_minutes:   interval
-		created_at:         now
-		next_update_at:     now
-	}
-	sql app.db {
-		insert row into RepoMirror
-	}!
+	return db_insert_returning_id(mut app.db, 'RepoMirror', ['repo_id', 'created_by', 'direction',
+		'url', 'encrypted_username', 'encrypted_password', 'encrypted_ssh_key', 'ssh_known_hosts',
+		'enabled', 'overwrite_diverged', 'only_protected', 'interval_minutes', 'created_at',
+		'last_update_at', 'next_update_at', 'last_error', 'consecutive_failures', 'is_syncing'], [
+		repo_id.str(),
+		created_by.str(),
+		direction,
+		clean_url,
+		encrypt_mirror_secret(app.config.storage_secret, username)!,
+		encrypt_mirror_secret(app.config.storage_secret, password)!,
+		encrypt_mirror_secret(app.config.storage_secret, ssh_private_key)!,
+		ssh_known_hosts.trim_space(),
+		db_bool_value(true),
+		db_bool_value(overwrite_diverged),
+		db_bool_value(only_protected),
+		interval.str(),
+		now.str(),
+		'0',
+		now.str(),
+		'',
+		'0',
+		db_bool_value(false),
+	])
 }
 
 fn (mut app App) delete_repo_mirror(repo_id int, mirror_id int) ! {
@@ -248,11 +272,27 @@ fn mirror_remote_name(id int) string {
 	return 'gitly-mirror-${id}'
 }
 
+fn write_private_mirror_file(path string, content string, mode int) ! {
+	mut file := os.open_file(path, 'w', mode)!
+	defer {
+		file.close()
+	}
+	file.write_string(content)!
+}
+
 fn prepare_mirror_auth(app &App, mirror RepoMirror) !(map[string]string, []string) {
 	username := decrypt_mirror_secret(app.config.storage_secret, mirror.encrypted_username)!
 	password := decrypt_mirror_secret(app.config.storage_secret, mirror.encrypted_password)!
 	ssh_key := decrypt_mirror_secret(app.config.storage_secret, mirror.encrypted_ssh_key)!
 	mut cleanup := []string{}
+	mut keep_files := false
+	defer {
+		if !keep_files {
+			for path in cleanup {
+				os.rm(path) or {}
+			}
+		}
+	}
 	endpoint := urllib.parse(mirror.url)!
 	if endpoint.scheme == 'ssh' {
 		if mirror.ssh_known_hosts.trim_space() == '' {
@@ -260,27 +300,26 @@ fn prepare_mirror_auth(app &App, mirror RepoMirror) !(map[string]string, []strin
 		}
 		known_hosts_path := os.join_path(os.temp_dir(),
 			'gitly-known-hosts-${os.getpid()}-${rand.ulid()}')
-		os.write_file(known_hosts_path, mirror.ssh_known_hosts + '\n')!
-		os.chmod(known_hosts_path, 0o600)!
 		cleanup << known_hosts_path
+		write_private_mirror_file(known_hosts_path, mirror.ssh_known_hosts + '\n', 0o600)!
 		mut ssh_key_path := ''
 		if ssh_key != '' {
 			ssh_key_path = os.join_path(os.temp_dir(),
 				'gitly-mirror-key-${os.getpid()}-${rand.ulid()}')
-			os.write_file(ssh_key_path, ssh_key)!
-			os.chmod(ssh_key_path, 0o600)!
 			cleanup << ssh_key_path
+			write_private_mirror_file(ssh_key_path, ssh_key, 0o600)!
 		}
 		wrapper_path := os.join_path(os.temp_dir(), 'gitly-ssh-${os.getpid()}-${rand.ulid()}.sh')
-		os.write_file(wrapper_path, r'#!/bin/sh
+		cleanup << wrapper_path
+		write_private_mirror_file(wrapper_path, r'#!/bin/sh
 set -- -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile="$GITLY_MIRROR_KNOWN_HOSTS" "$@"
 if [ -n "$GITLY_MIRROR_SSH_KEY" ]; then
   set -- -i "$GITLY_MIRROR_SSH_KEY" -o IdentitiesOnly=yes "$@"
 fi
 exec ssh "$@"
-')!
-		os.chmod(wrapper_path, 0o700)!
-		cleanup << wrapper_path
+',
+			0o700)!
+		keep_files = true
 		return {
 			'GIT_SSH':                  wrapper_path
 			'GIT_TERMINAL_PROMPT':      '0'
@@ -289,19 +328,21 @@ exec ssh "$@"
 		}, cleanup
 	}
 	if username == '' && password == '' {
+		keep_files = true
 		return {
 			'GIT_TERMINAL_PROMPT': '0'
 		}, cleanup
 	}
 	path := os.join_path(os.temp_dir(), 'gitly-askpass-${os.getpid()}-${rand.ulid()}.sh')
-	os.write_file(path, r'#!/bin/sh
+	cleanup << path
+	write_private_mirror_file(path, r'#!/bin/sh
 case "$1" in
   *Username*) printf "%s\n" "$GITLY_MIRROR_USERNAME" ;;
   *) printf "%s\n" "$GITLY_MIRROR_PASSWORD" ;;
 esac
-')!
-	os.chmod(path, 0o700)!
-	cleanup << path
+',
+		0o700)!
+	keep_files = true
 	return {
 		'GIT_ASKPASS':           path
 		'GIT_ASKPASS_REQUIRE':   'force'
@@ -339,8 +380,8 @@ fn mirror_remote_branches(repo Repo, mirror RepoMirror) ![]string {
 
 fn (mut app App) pull_repo_mirror(repo Repo, mirror RepoMirror, env map[string]string) ! {
 	remote := mirror_remote_name(mirror.id)
-	fetch := git.Git.exec_in_dir_with_env(repo.git_dir, ['fetch', '--prune', '--no-tags', remote,
-		'+refs/heads/*:refs/remotes/${remote}/*',
+	fetch := git.Git.exec_in_dir_with_env(repo.git_dir, ['-c', 'http.followRedirects=false', 'fetch',
+		'--prune', '--no-tags', remote, '+refs/heads/*:refs/remotes/${remote}/*',
 		'+refs/tags/*:refs/gitly-mirrors/${mirror.id}/tags/*'], env)
 	if fetch.exit_code != 0 {
 		return error('Mirror fetch failed: ${fetch.output.trim_space()}')
@@ -351,32 +392,54 @@ fn (mut app App) pull_repo_mirror(repo Repo, mirror RepoMirror, env map[string]s
 		}
 		local_ref := 'refs/heads/${branch}'
 		remote_ref := 'refs/remotes/${remote}/${branch}'
+		remote_sha := git_rev_parse(repo.git_dir, remote_ref) or {
+			return error('Could not resolve mirrored branch ${branch}')
+		}
 		local_exists := git.Git.exec_in_dir(repo.git_dir, ['show-ref', '--verify', '--quiet',
 			local_ref]).exit_code == 0
-		if local_exists && !mirror.overwrite_diverged {
-			ff := git.Git.exec_in_dir(repo.git_dir, ['merge-base', '--is-ancestor', local_ref,
-				remote_ref])
-			if ff.exit_code != 0 {
-				return error('Mirror branch ${branch} diverged; enable overwrite to replace it')
+		mut expected_old_sha := zero_oid_like(remote_sha)!
+		if local_exists {
+			expected_old_sha = git_rev_parse(repo.git_dir, local_ref) or {
+				return error('Could not resolve local branch ${branch}')
+			}
+			if !mirror.overwrite_diverged {
+				ff := git.Git.exec_in_dir(repo.git_dir, ['merge-base', '--is-ancestor',
+					expected_old_sha, remote_sha])
+				if ff.exit_code != 0 {
+					return error('Mirror branch ${branch} diverged; enable overwrite to replace it')
+				}
 			}
 		}
-		update := git.Git.exec_in_dir(repo.git_dir, ['update-ref', local_ref, remote_ref])
-		if update.exit_code != 0 {
+		update_git_ref_expected(repo.git_dir, local_ref, remote_sha, expected_old_sha) or {
 			return error('Could not update mirrored branch ${branch}')
 		}
 	}
 	if !mirror.only_protected {
 		tags := git.Git.exec_in_dir(repo.git_dir, ['for-each-ref', '--format=%(refname:strip=4)',
 			'refs/gitly-mirrors/${mirror.id}/tags'])
+		if tags.exit_code != 0 {
+			return error('Could not inspect fetched mirror tags')
+		}
 		for tag in tags.output.split_into_lines().map(it.trim_space()).filter(it != '') {
 			local_ref := 'refs/tags/${tag}'
 			remote_ref := 'refs/gitly-mirrors/${mirror.id}/tags/${tag}'
+			remote_sha := git_rev_parse(repo.git_dir, remote_ref) or {
+				return error('Could not resolve mirrored tag ${tag}')
+			}
 			exists := git.Git.exec_in_dir(repo.git_dir,
 				['show-ref', '--verify', '--quiet', local_ref]).exit_code == 0
+			mut expected_old_sha := zero_oid_like(remote_sha)!
 			if exists && !mirror.overwrite_diverged {
 				continue
 			}
-			git.Git.exec_in_dir(repo.git_dir, ['update-ref', local_ref, remote_ref])
+			if exists {
+				expected_old_sha = git_rev_parse(repo.git_dir, local_ref) or {
+					return error('Could not resolve local tag ${tag}')
+				}
+			}
+			update_git_ref_expected(repo.git_dir, local_ref, remote_sha, expected_old_sha) or {
+				return error('Could not update mirrored tag ${tag}')
+			}
 		}
 	}
 	mut refreshed := repo
@@ -394,7 +457,7 @@ fn local_repo_branches(repo Repo) []string {
 
 fn (app &App) push_repo_mirror(repo Repo, mirror RepoMirror, env map[string]string) ! {
 	remote := mirror_remote_name(mirror.id)
-	mut args := ['push']
+	mut args := ['-c', 'http.followRedirects=false', 'push']
 	if !mirror.only_protected {
 		args << '--prune'
 	}
@@ -406,7 +469,7 @@ fn (app &App) push_repo_mirror(repo Repo, mirror RepoMirror, env map[string]stri
 				args << '${prefix}refs/heads/${branch}:refs/heads/${branch}'
 			}
 		}
-		if args.len == 2 {
+		if args.len == 4 {
 			return error('No protected branches are available to mirror')
 		}
 	} else {

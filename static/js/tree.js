@@ -1,13 +1,26 @@
-const branchSelectEl = document.querySelector(".branch-select");
-branchSelectEl.addEventListener("change", (event) => {
-  let nextUrl = TREE_BRANCH_PATH_TEMPLATE + event.target.value;
-  if (typeof TREE_MODE !== "undefined" && TREE_MODE === "top-files") {
-    nextUrl += "?mode=top-files";
-  }
-  window.location.href = nextUrl;
-});
+const treeContextEl = document.getElementById("tree-context");
+const TREE_BRANCH_PATH_TEMPLATE = treeContextEl?.dataset.treeBase || "";
+const BRANCH_NAME = treeContextEl?.dataset.branch || "";
+const REPO_ID = Number(treeContextEl?.dataset.repoId || 0);
+const CURRENT_PATH = treeContextEl?.dataset.currentPath || "";
+const REPO_USER = treeContextEl?.dataset.repoUser || "";
+const REPO_NAME = treeContextEl?.dataset.repoName || "";
+const TREE_MODE = treeContextEl?.dataset.treeMode || "tree";
+const TREE_FOLDER_SIZE_ENABLED = treeContextEl?.dataset.folderSizeEnabled === "true";
 
-branchSelectEl.value = BRANCH_NAME;
+const branchSelectEl = document.querySelector(".branch-select");
+if (branchSelectEl) {
+  branchSelectEl.addEventListener("change", (event) => {
+    const encodedRef = event.target.value.split("/").map(encodeURIComponent).join("/");
+    let nextUrl = TREE_BRANCH_PATH_TEMPLATE + encodedRef;
+    if (TREE_MODE === "top-files") {
+      nextUrl += "?mode=top-files";
+    }
+    window.location.href = nextUrl;
+  });
+
+  branchSelectEl.value = BRANCH_NAME;
+}
 
 // Make the entire row clickable
 const fileEls = document.querySelectorAll(".file");
@@ -28,7 +41,7 @@ async function starRepo(repoId) {
   const json = await response.json();
 
   if (json.success) {
-    return json.result === "true";
+    return json.result === true;
   } else {
     throw new Error(json.message);
   }
@@ -46,10 +59,12 @@ if (starButtonEl) {
   });
 }
 
-const copyCloneURLButton = document.querySelector(".copy-clone-url-button");
-if (copyCloneURLButton) {
-  copyCloneURLButton.addEventListener("click", async () => {
-    const url = document.querySelector(".clone-input-group > input").value;
+const copyCloneURLButtons = document.querySelectorAll(".copy-clone-url-button");
+copyCloneURLButtons.forEach((button) => {
+  button.addEventListener("click", async () => {
+    const input = button.closest(".clone-input-group")?.querySelector("input");
+    if (!input) return;
+    const url = input.value;
 
     if (navigator && navigator.clipboard && navigator.clipboard.writeText) {
       return navigator.clipboard.writeText(url);
@@ -57,7 +72,7 @@ if (copyCloneURLButton) {
 
     alert("The Clipboard API is not available.");
   });
-}
+});
 
 const watchButtonEl = document.querySelector(".watch-button");
 
@@ -115,7 +130,7 @@ if (watchButtonEl) {
 
   if (!hasMissingInfo()) return;
 
-  const path = typeof CURRENT_PATH !== "undefined" ? CURRENT_PATH : "";
+  const path = CURRENT_PATH;
   const apiUrl = "/api/v1/repos/" + REPO_ID + "/tree/files?branch=" +
     encodeURIComponent(BRANCH_NAME) + "&path=" + encodeURIComponent(path);
 

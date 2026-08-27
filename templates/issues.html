@@ -20,6 +20,11 @@
 					@end
 				</div>
 			</div>
+			<nav class="issue-state-tabs" aria-label="Issue state">
+				<a href="/@repo.user_name/@repo.name/issues?state=open" class="@open_tab_class">Open (@open_issue_count)</a>
+				<a href="/@repo.user_name/@repo.name/issues?state=closed" class="@closed_tab_class">Closed (@closed_issue_count)</a>
+				<a href="/@repo.user_name/@repo.name/issues?state=all" class="@all_tab_class">All (@all_issue_count)</a>
+			</nav>
 
 			@if issues_with_users.len == 0
 				<div class="issues-empty">%issue_none</div>
@@ -30,13 +35,13 @@
 					@if first
 						<span class="issue-pager__btn issue-pager__btn--disabled">Prev</span>
 					@else
-						<a class="issue-pager__btn" href="/@repo.user_name/@repo.name/issues/@prev_page">Prev</a>
+						<a class="issue-pager__btn" href="/@repo.user_name/@repo.name/issues/@prev_page?state=@current_state">Prev</a>
 					@end
 					<span class="issue-pager__info">@page of @page_count</span>
 					@if last
 						<span class="issue-pager__btn issue-pager__btn--disabled">Next</span>
 					@else
-						<a class="issue-pager__btn" href="/@repo.user_name/@repo.name/issues/@next_page">Next</a>
+						<a class="issue-pager__btn" href="/@repo.user_name/@repo.name/issues/@next_page?state=@current_state">Next</a>
 					@end
 				</div>
 			@end

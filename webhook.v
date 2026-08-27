@@ -10,6 +10,9 @@ import crypto.hmac
 import crypto.sha256
 import encoding.hex
 import x.json2 as json
+import config
+
+const supported_webhook_events = ['push', 'issue', 'pr', 'comment', 'release']
 
 pub struct WebhookIssuePayload {
 	action string
@@ -96,12 +99,33 @@ fn (w &Webhook) event_list() []string {
 	return out
 }
 
+fn normalize_webhook_events(raw string) !string {
+	if raw.trim_space() == '' {
+		return supported_webhook_events.join(',')
+	}
+	mut normalized := []string{}
+	for value in raw.split(',') {
+		event := value.trim_space().to_lower()
+		if event !in supported_webhook_events {
+			return error('unsupported webhook event `${event}`')
+		}
+		if event !in normalized {
+			normalized << event
+		}
+	}
+	if normalized.len == 0 {
+		return error('at least one webhook event is required')
+	}
+	return normalized.join(',')
+}
+
 fn (mut app App) add_webhook(repo_id int, url string, secret string, events string) ! {
+	clean_events := normalize_webhook_events(events)!
 	wh := Webhook{
 		repo_id:    repo_id
 		url:        url
 		secret:     secret
-		events:     events
+		events:     clean_events
 		is_active:  true
 		created_at: int(time.now().unix())
 	}
@@ -186,8 +210,22 @@ fn (mut app App) fan_out_webhook(repo_id int, event string, body string) {
 		if !wh.has_event(event) {
 			continue
 		}
-		spawn app.deliver_webhook(wh, event, body)
+		spawn deliver_webhook_in_background(wh, event, body, app.config)
 	}
+}
+
+fn deliver_webhook_in_background(wh Webhook, event string, body string, conf config.Config) {
+	mut worker := &App{
+		db:     connect_db(conf) or {
+			eprintln('webhook ${wh.id}: could not open ${db_backend_name()} connection: ${err}')
+			return
+		}
+		config: conf
+	}
+	defer {
+		worker.db.close() or {}
+	}
+	worker.deliver_webhook(wh, event, body)
 }
 
 // is_blocked_ipv4 reports whether the dotted-quad IPv4 string falls in a range

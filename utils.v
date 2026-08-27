@@ -22,14 +22,19 @@ pub fn (mut ctx Context) make_path(branch_name string, i int) string {
 		return ctx.path_split[..i + 1].join('/')
 	}
 	mut s := ctx.path_split[0]
-	s += '/tree/${branch_name}/'
-	s += ctx.path_split[1..i + 1].join('/')
+	s += '/tree/${repo_url_path(branch_name)}/'
+	s += repo_url_path(ctx.path_split[1..i + 1].join('/'))
 	return s
 }
 
 fn create_directory_if_not_exists(path string) {
+	if path.trim_space() == '' {
+		panic('cannot create a directory with an empty path')
+	}
 	if !os.exists(path) {
-		os.mkdir(path) or { panic('cannot create ${path} directory') }
+		os.mkdir_all(path) or { panic('cannot create ${path} directory: ${err}') }
+	} else if !os.is_dir(path) {
+		panic('${path} exists but is not a directory')
 	}
 }
 
@@ -64,7 +69,7 @@ fn check_first_page(page int) bool {
 }
 
 fn check_last_page(total int, offset int, per_page int) bool {
-	return (total - offset) < per_page
+	return total - offset <= per_page
 }
 
 fn minify_pr_files_html(mut ctx Context) bool {

@@ -62,18 +62,20 @@ fn (mut app App) add_commit(repo_id int, branch_id int, last_hash string, author
 	mut existing := app.find_repo_commit_by_hash(repo_id, last_hash)
 	mut commit_id := existing.id
 	if commit_id == 0 {
-		new_commit := Commit{
-			author_id:  author_id
-			author:     author
-			hash:       last_hash
-			created_at: date
-			repo_id:    repo_id
-			message:    message
+		commit_id = db_insert_returning_id(mut app.db, 'Commit', ['author_id', 'author', 'hash',
+			'created_at', 'repo_id', 'message'], [author_id.str(), author, last_hash, date.str(),
+			repo_id.str(), message]) or {
+			// Another repository refresh may have inserted this immutable commit
+			// between our lookup and INSERT. Reuse that row on a uniqueness race.
+			if !is_unique_constraint_error(err) {
+				return err
+			}
+			existing = app.find_repo_commit_by_hash(repo_id, last_hash)
+			if existing.id == 0 {
+				return err
+			}
+			existing.id
 		}
-		sql app.db {
-			insert new_commit into Commit
-		}!
-		commit_id = db_last_insert_id(mut app.db)
 	}
 	link := BranchCommit{
 		branch_id: branch_id
@@ -81,12 +83,36 @@ fn (mut app App) add_commit(repo_id int, branch_id int, last_hash string, author
 	}
 	sql app.db {
 		insert link into BranchCommit
-	}!
+	} or {
+		// Linking the same commit to the same branch is idempotent when two
+		// refreshes overlap.
+		if !is_unique_constraint_error(err) {
+			return err
+		}
+	}
+}
+
+// Remove branch membership rows for commits that are no longer reachable from
+// the branch tip (for example after an allowed force-push or mirror overwrite).
+// Commit rows themselves are shared by every branch in the repository and are
+// intentionally retained.
+fn (mut app App) prune_branch_commit_links(repo_id int, branch_id int, reachable map[string]bool) ! {
+	rows := db_exec_values(mut app.db,
+		'select bc.id, c.hash from ${sql_table('BranchCommit')} bc join ${sql_table('Commit')} c on c.id = bc.commit_id where c.repo_id = ${repo_id} and bc.branch_id = ${branch_id}')!
+	for row in rows {
+		if row.len < 2 || row[1] in reachable {
+			continue
+		}
+		link_id := row[0].int()
+		sql app.db {
+			delete from BranchCommit where id == link_id
+		}!
+	}
 }
 
 fn (mut app App) find_repo_commits_as_page(repo_id int, branch_id int, offset int) []Commit {
 	rows := db_exec_values(mut app.db,
-		'select ${commit_select_cols} from ${sql_table('Commit')} c join ${sql_table('BranchCommit')} bc on bc.commit_id = c.id where c.repo_id = ${repo_id} and bc.branch_id = ${branch_id} order by c.created_at desc limit 35 offset ${offset}') or {
+		'select ${commit_select_cols} from ${sql_table('Commit')} c join ${sql_table('BranchCommit')} bc on bc.commit_id = c.id where c.repo_id = ${repo_id} and bc.branch_id = ${branch_id} order by c.created_at desc, c.id desc limit 35 offset ${offset}') or {
 		return []Commit{}
 	}
 	mut commits := []Commit{cap: rows.len}
@@ -119,7 +145,7 @@ fn (mut app App) find_repo_commit_by_hash(repo_id int, hash string) Commit {
 
 fn (mut app App) find_repo_last_commit(repo_id int, branch_id int) Commit {
 	rows := db_exec_values(mut app.db,
-		'select ${commit_select_cols} from ${sql_table('Commit')} c join ${sql_table('BranchCommit')} bc on bc.commit_id = c.id where c.repo_id = ${repo_id} and bc.branch_id = ${branch_id} order by c.created_at desc limit 1') or {
+		'select ${commit_select_cols} from ${sql_table('Commit')} c join ${sql_table('BranchCommit')} bc on bc.commit_id = c.id where c.repo_id = ${repo_id} and bc.branch_id = ${branch_id} order by c.created_at desc, c.id desc limit 1') or {
 		return Commit{}
 	}
 	if rows.len == 0 {
@@ -160,6 +186,9 @@ fn (app App) get_repo_activity_buckets(repo_id int) []int {
 // get_user_daily_activity returns commit counts per day for the given user
 // over the past `days` days. Index 0 is the oldest day, index `days-1` is today.
 fn (app App) get_user_daily_activity(user_id int, days int) []int {
+	if user_id <= 0 || days <= 0 {
+		return []int{}
+	}
 	day_seconds := 24 * 3600
 	now := time.now()
 	// Anchor to the start of today (local), so today is always the last bucket.

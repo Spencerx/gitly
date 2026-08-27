@@ -22,23 +22,12 @@ pub fn (mut app App) accept_repo_transfer(mut ctx Context, username string, id s
 	if transfer.recipient_id != ctx.user.id {
 		return ctx.not_found()
 	}
-	repo := app.find_repo_by_id(transfer.repo_id) or {
-		app.delete_repo_transfer(transfer.id) or {}
-		return ctx.not_found()
-	}
-	if app.user_has_repo(ctx.user.id, repo.name) {
-		ctx.error('You already own a repository named ${repo.name}')
-		return app.repo_transfers(mut ctx, username)
-	}
-	if !ctx.is_admin() && app.get_count_user_repos(ctx.user.id) >= max_user_repos {
-		ctx.error('You have reached the repository limit')
-		return app.repo_transfers(mut ctx, username)
-	}
-	app.move_repo_to_user(repo, ctx.user) or {
+	// Every mutable precondition is reloaded under the transfer transaction's
+	// locks. The lookup above is only an authorization-preserving 404 preflight.
+	repo := app.accept_repo_transfer_atomic(transfer.id, ctx.user.id) or {
 		ctx.error('There was an error while accepting the repository transfer')
 		return app.repo_transfers(mut ctx, username)
 	}
-	app.delete_repo_transfer(transfer.id) or { app.info('failed to clear repo transfer: ${err}') }
 	return ctx.redirect('/${ctx.user.username}/${repo.name}')
 }
 

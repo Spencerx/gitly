@@ -4,6 +4,7 @@
 	"avatars_path": "./avatars",
 	"hostname": "gitly.org",
 	"ci_service_url": "http://localhost:8081",
+	"ci_callback_url": "",
 	"ci_secret": "",
 	"cookie_secure": false,
 	"storage_secret": "",

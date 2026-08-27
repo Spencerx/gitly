@@ -66,10 +66,11 @@ mut:
 // review timeline. The unique pair ensures one person can contribute at most
 // one approval regardless of how many reviews they submit.
 struct PrApproval {
-	id         int @[primary; sql: serial]
-	pr_id      int @[unique: 'pr_approval']
-	user_id    int @[unique: 'pr_approval']
-	created_at int
+	id                int @[primary; sql: serial]
+	pr_id             int @[unique: 'pr_approval']
+	user_id           int @[unique: 'pr_approval']
+	approved_head_oid string
+	created_at        int
 }
 
 struct PrApprovalView {
@@ -166,21 +167,11 @@ fn (mut app App) add_pull_request_with_created_at(repo_id int, author_id int, ti
 
 fn (mut app App) add_pull_request_from_repo_with_created_at(repo_id int, head_repo_id int,
 	author_id int, title string, description string, head string, base string, created_at int) !int {
-	pr := PullRequest{
-		repo_id:      repo_id
-		head_repo_id: head_repo_id
-		author_id:    author_id
-		title:        title
-		description:  description
-		head_branch:  head
-		base_branch:  base
-		status:       int(PrStatus.open)
-		created_at:   created_at
-	}
-	sql app.db {
-		insert pr into PullRequest
-	}!
-	return db_last_insert_id(mut app.db)
+	return db_insert_returning_id(mut app.db, 'PullRequest', ['repo_id', 'head_repo_id', 'author_id',
+		'title', 'description', 'head_branch', 'base_branch', 'status', 'comments_count',
+		'created_at', 'merged_at', 'merge_commit_hash'], [repo_id.str(),
+		head_repo_id.str(), author_id.str(), title, description, head, base, int(PrStatus.open).str(),
+		'0', created_at.str(), '0', ''])
 }
 
 fn (mut app App) add_pull_request_from_repo(repo_id int, head_repo_id int, author_id int,
@@ -304,17 +295,9 @@ fn (mut app App) get_pr_comments(pr_id int) []PrComment {
 }
 
 fn (mut app App) add_pr_review(pr_id int, author_id int, state int, body string) !int {
-	review := PrReview{
-		pr_id:      pr_id
-		author_id:  author_id
-		state:      state
-		body:       body
-		created_at: int(time.now().unix())
-	}
-	sql app.db {
-		insert review into PrReview
-	}!
-	return db_last_insert_id(mut app.db)
+	return db_insert_returning_id(mut app.db, 'PrReview', ['pr_id', 'author_id', 'state', 'body',
+		'created_at'],
+		[pr_id.str(), author_id.str(), state.str(), body, int(time.now().unix()).str()])
 }
 
 fn (mut app App) get_pr_reviews(pr_id int) []PrReview {
@@ -327,16 +310,31 @@ fn (mut app App) approve_pull_request(pr_id int, user_id int) ! {
 	if pr_id <= 0 || user_id <= 0 {
 		return error('invalid approval')
 	}
-	count := sql app.db {
+	pr := app.find_pull_request_by_id(pr_id) or { return error('merge request not found') }
+	if !pr.is_open() {
+		return error('merge request is not open')
+	}
+	repo := app.find_repo_by_id(pr.repo_id) or { return error('repository not found') }
+	// Imported fork refs can lag their source. Refresh before resolving the OID
+	// so the approval records the exact candidate the reviewer is approving.
+	app.refresh_cross_fork_pr_head(repo, pr)!
+	head_oid := app.pull_request_head_oid(pr)!
+	now := int(time.now().unix())
+	existing := sql app.db {
 		select count from PrApproval where pr_id == pr_id && user_id == user_id
-	} or { 0 }
-	if count > 0 {
+	}!
+	if existing > 0 {
+		sql app.db {
+			update PrApproval set approved_head_oid = head_oid, created_at = now where pr_id == pr_id
+			&& user_id == user_id
+		}!
 		return
 	}
 	approval := PrApproval{
-		pr_id:      pr_id
-		user_id:    user_id
-		created_at: int(time.now().unix())
+		pr_id:             pr_id
+		user_id:           user_id
+		approved_head_oid: head_oid
+		created_at:        now
 	}
 	sql app.db {
 		insert approval into PrApproval
@@ -350,21 +348,42 @@ fn (mut app App) revoke_pull_request_approval(pr_id int, user_id int) ! {
 }
 
 fn (mut app App) pull_request_approval_count(pr_id int) int {
-	return app.find_pull_request_approvals(pr_id).len
+	pr := app.find_pull_request_by_id(pr_id) or { return 0 }
+	head_oid := app.pull_request_head_oid(pr) or { return 0 }
+	return app.find_pull_request_approvals_for_head(pr, head_oid).len
 }
 
-fn (app &App) user_approved_pull_request(pr_id int, user_id int) bool {
+fn (mut app App) user_approved_pull_request(pr_id int, user_id int) bool {
+	pr := app.find_pull_request_by_id(pr_id) or { return false }
+	head_oid := app.pull_request_head_oid(pr) or { return false }
+	return app.user_approved_pull_request_at_head(pr_id, user_id, head_oid)
+}
+
+fn (app &App) user_approved_pull_request_at_head(pr_id int, user_id int, head_oid string) bool {
+	if !is_full_git_oid(head_oid) {
+		return false
+	}
 	count := sql app.db {
 		select count from PrApproval where pr_id == pr_id && user_id == user_id
+		&& approved_head_oid == head_oid
 	} or { 0 }
 	return count > 0
 }
 
 fn (mut app App) find_pull_request_approvals(pr_id int) []PrApprovalView {
 	pr := app.find_pull_request_by_id(pr_id) or { return []PrApprovalView{} }
+	head_oid := app.pull_request_head_oid(pr) or { return []PrApprovalView{} }
+	return app.find_pull_request_approvals_for_head(pr, head_oid)
+}
+
+fn (mut app App) find_pull_request_approvals_for_head(pr PullRequest, head_oid string) []PrApprovalView {
+	if !is_full_git_oid(head_oid) {
+		return []PrApprovalView{}
+	}
 	repo := app.find_repo_by_id(pr.repo_id) or { return []PrApprovalView{} }
+	pr_id := pr.id
 	approvals := sql app.db {
-		select from PrApproval where pr_id == pr_id order by created_at
+		select from PrApproval where pr_id == pr_id && approved_head_oid == head_oid order by created_at
 	} or { []PrApproval{} }
 	mut result := []PrApprovalView{cap: approvals.len}
 	for approval in approvals {
@@ -382,7 +401,33 @@ fn (mut app App) find_pull_request_approvals(pr_id int) []PrApprovalView {
 }
 
 fn (mut app App) pull_request_approvals_satisfied(pr PullRequest, repo Repo) bool {
-	return app.pull_request_approval_count(pr.id) >= repo.required_approvals
+	head_oid := app.pull_request_head_oid(pr) or { return false }
+	return app.pull_request_approvals_satisfied_at_head(pr, repo, head_oid)
+}
+
+fn (mut app App) pull_request_approvals_satisfied_at_head(pr PullRequest, repo Repo, head_oid string) bool {
+	return app.find_pull_request_approvals_for_head(pr, head_oid).len >= repo.required_approvals
+}
+
+fn (app &App) pull_request_head_oid(pr PullRequest) !string {
+	repo := app.find_repo_by_id(pr.repo_id) or { return error('repository not found') }
+	head_oid := git_rev_parse(repo.git_dir, pr.head_ref())!
+	if !is_full_git_oid(head_oid) {
+		return error('merge request head is not a full object id')
+	}
+	return head_oid
+}
+
+fn is_full_git_oid(oid string) bool {
+	if oid.len !in [40, 64] {
+		return false
+	}
+	for ch in oid.to_lower() {
+		if !ch.is_digit() && (ch < `a` || ch > `f`) {
+			return false
+		}
+	}
+	return true
 }
 
 fn (mut app App) clear_pull_request_approvals(pr_id int) ! {

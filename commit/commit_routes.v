@@ -8,17 +8,25 @@ import git
 @['/api/v1/:user/:repo_name/:branch_name/commits/count']
 fn (mut app App) handle_commits_count(mut ctx Context, username string, repo_name string, branch_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 	caller := app.api_user_from_ctx(ctx) or { User{} }
 	if !app.user_has_repo_read_access(caller.id, repo) {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 	if !is_safe_ref(branch_name) {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 
 	branch := app.find_repo_branch_by_name(repo.id, branch_name)
+	if branch.id == 0 {
+		// An unborn default branch has no Branch row until its first push. Keep
+		// the count endpoint useful for a freshly-created empty repository while
+		// still rejecting arbitrary unknown branch names.
+		if branch_name != repo.primary_branch || app.get_count_repo_branches(repo.id) != 0 {
+			return ctx.api_not_found()
+		}
+	}
 	count := app.get_repo_commit_count(repo.id, branch.id)
 
 	// app.debug("${branch} ${count}" )
@@ -31,6 +39,18 @@ fn (mut app App) handle_commits_count(mut ctx Context, username string, repo_nam
 
 @['/:username/:repo_name/:branch_name/commits/:page']
 pub fn (mut app App) commits(mut ctx Context, username string, repo_name string, branch_name string, page string) veb.Result {
+	return app.render_commits(mut ctx, username, repo_name, branch_name, page)
+}
+
+// Canonical commit-history route. Keeping the ref in the final catch-all makes
+// branch names containing `/` unambiguous; page selection lives in the query.
+@['/:username/:repo_name/-/commits/:branch_name...']
+pub fn (mut app App) commits_by_ref(mut ctx Context, username string, repo_name string, branch_name string) veb.Result {
+	page := ctx.query['page'] or { '0' }
+	return app.render_commits(mut ctx, username, repo_name, branch_name, page)
+}
+
+fn (mut app App) render_commits(mut ctx Context, username string, repo_name string, branch_name string, page string) veb.Result {
 	if !is_safe_ref(branch_name) {
 		return ctx.not_found()
 	}
@@ -41,6 +61,9 @@ pub fn (mut app App) commits(mut ctx Context, username string, repo_name string,
 	}
 
 	branch := app.find_repo_branch_by_name(repo.id, branch_name)
+	if branch.id == 0 {
+		return ctx.not_found()
+	}
 	commits_count := app.get_repo_commit_count(repo.id, branch.id)
 
 	// FIXME: b_author always false
@@ -82,7 +105,7 @@ pub fn (mut app App) commits(mut ctx Context, username string, repo_name string,
 		}
 	}
 
-	return $veb.html()
+	return $veb.html('templates/commits.html')
 }
 
 @['/:username/:repo_name/commit/:hash']

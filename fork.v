@@ -5,6 +5,7 @@ module main
 import os
 import time
 import git
+import rand
 
 struct RepoFork {
 	id              int @[primary; sql: serial]
@@ -80,7 +81,7 @@ fn fetch_fork_branch_into(target Repo, source Repo, branch string, destination_r
 	}
 }
 
-fn (app &App) refresh_cross_fork_pr_head(target Repo, pr PullRequest) ! {
+fn (mut app App) refresh_cross_fork_pr_head(target Repo, pr PullRequest) ! {
 	if pr.head_repo_id <= 0 || pr.head_repo_id == target.id {
 		return
 	}
@@ -90,7 +91,42 @@ fn (app &App) refresh_cross_fork_pr_head(target Repo, pr PullRequest) ! {
 	source := app.find_repo_by_id(pr.head_repo_id) or {
 		return error('The source fork no longer exists')
 	}
-	fetch_fork_branch_into(target, source, pr.head_branch, pr.head_ref())!
+	candidate_ref := 'refs/gitly-fetches/${pr.id}/${rand.ulid()}'
+	defer {
+		git.Git.exec_in_dir(target.git_dir, ['update-ref', '-d', candidate_ref])
+	}
+	// Fetch into an isolated ref first. Approval state is invalidated before the
+	// public merge-request ref advances, so a transient database error can never
+	// leave a new revision paired with approvals for the old one.
+	fetch_fork_branch_into(target, source, pr.head_branch, candidate_ref)!
+	new_head := git_rev_parse(target.git_dir, candidate_ref)!
+	old_head := git_rev_parse(target.git_dir, pr.head_ref()) or { '' }
+	if old_head == new_head {
+		return
+	}
+	app.clear_pull_request_approvals(pr.id)!
+	expected_old := if old_head == '' { zero_oid_like(new_head)! } else { old_head }
+	update_git_ref_expected(target.git_dir, pr.head_ref(), new_head, expected_old)!
+}
+
+// Refresh cross-fork merge-request refs when the source branch changes. Page
+// views remain read-only, while pushes and web edits publish the new candidate
+// and invalidate approvals as part of the repository update workflow.
+fn (mut app App) refresh_open_cross_fork_pr_heads(source_repo_id int, branch string) {
+	if source_repo_id <= 0 || !is_safe_ref(branch) {
+		return
+	}
+	wanted := int(PrStatus.open)
+	prs := sql app.db {
+		select from PullRequest where head_repo_id == source_repo_id && head_branch == branch
+		&& status == wanted
+	} or { []PullRequest{} }
+	for pr in prs {
+		target := app.find_repo_by_id(pr.repo_id) or { continue }
+		app.refresh_cross_fork_pr_head(target, pr) or {
+			app.warn('Could not refresh merge request ${pr.id} after ${branch} changed: ${err}')
+		}
+	}
 }
 
 fn (mut app App) delete_repo_fork_relationships(repo_id int) ! {
@@ -208,9 +244,13 @@ fn (mut app App) sync_fork(repo Repo, relation RepoFork, default_branch_only boo
 		return error('Invalid fork relationship')
 	}
 	source := app.find_repo_by_id(relation.source_repo_id) or {
+		app.record_fork_sync(relation.id, 'The upstream repository no longer exists')
 		return error('The upstream repository no longer exists')
 	}
-	configure_fork_remote(repo.git_dir, source)!
+	configure_fork_remote(repo.git_dir, source) or {
+		app.record_fork_sync(relation.id, err.str())
+		return err
+	}
 	fetch := git.Git.exec_in_dir(repo.git_dir, ['fetch', '--prune', '--no-tags', 'upstream',
 		'+refs/heads/*:refs/remotes/upstream/*'])
 	if fetch.exit_code != 0 {
@@ -231,28 +271,41 @@ fn (mut app App) sync_fork(repo Repo, relation RepoFork, default_branch_only boo
 		}
 		local_ref := 'refs/heads/${branch}'
 		remote_ref := 'refs/remotes/upstream/${branch}'
+		remote_sha := git_rev_parse(repo.git_dir, remote_ref) or {
+			result.skipped << branch
+			continue
+		}
 		local_exists := git.Git.exec_in_dir(repo.git_dir, ['show-ref', '--verify', '--quiet',
 			local_ref]).exit_code == 0
+		mut expected_old_sha := zero_oid_like(remote_sha) or {
+			result.skipped << branch
+			continue
+		}
 		if local_exists {
-			ff := git.Git.exec_in_dir(repo.git_dir, ['merge-base', '--is-ancestor', local_ref,
-				remote_ref])
+			expected_old_sha = git_rev_parse(repo.git_dir, local_ref) or {
+				result.skipped << branch
+				continue
+			}
+			ff := git.Git.exec_in_dir(repo.git_dir, ['merge-base', '--is-ancestor', expected_old_sha,
+				remote_sha])
 			if ff.exit_code != 0 {
 				result.skipped << branch
 				continue
 			}
 		}
-		update := git.Git.exec_in_dir(repo.git_dir, ['update-ref', local_ref, remote_ref])
-		if update.exit_code == 0 {
-			result.updated << branch
-		} else {
+		update_git_ref_expected(repo.git_dir, local_ref, remote_sha, expected_old_sha) or {
 			result.skipped << branch
+			continue
 		}
+		result.updated << branch
 	}
-	app.record_fork_sync(relation.id, '')
 	mut refreshed := repo
 	app.update_repo_from_fs(mut refreshed, false) or {
-		return error('Branches synchronized, but the repository cache could not be refreshed')
+		message := 'Branches synchronized, but the repository cache could not be refreshed'
+		app.record_fork_sync(relation.id, message)
+		return error(message)
 	}
+	app.record_fork_sync(relation.id, '')
 	return result
 }
 

@@ -139,7 +139,7 @@ fn (mut app App) handle_git_receive_pack(username string, git_repo_name string) 
 		for update in updates {
 			branch_name := update.branch_name() or { continue }
 			if !update.is_delete() {
-				spawn app.trigger_ci_if_configured(repo.id, branch_name)
+				spawn run_ci_trigger_if_configured(repo.id, branch_name, app.config)
 			}
 		}
 	}
@@ -158,7 +158,7 @@ fn (mut app App) check_git_http_access(mut ctx Context, repo Repo, require_write
 		return none
 	}
 
-	user := app.user_from_basic_credentials(ctx) or {
+	user := app.user_from_basic_credentials(ctx, require_write) or {
 		ctx.send_unauthorized()
 		return none
 	}
@@ -196,10 +196,10 @@ fn (ctx &Context) extract_user_credentials() ?(string, string) {
 	return decode_basic_auth(auth_header_parts[1])
 }
 
-fn (mut app App) user_from_basic_credentials(ctx &Context) ?User {
-	username, password := ctx.extract_user_credentials() or { return none }
-	if username.len == 0 || username.len > max_username_len || password.len == 0
-		|| password.len > max_password_len {
+fn (mut app App) user_from_basic_credentials(ctx &Context, require_write bool) ?User {
+	username, credential := ctx.extract_user_credentials() or { return none }
+	if username.len == 0 || username.len > max_username_len || credential.len == 0
+		|| credential.len > max_password_len {
 		return none
 	}
 	user := app.get_user_by_username(username) or { return none }
@@ -207,10 +207,29 @@ fn (mut app App) user_from_basic_credentials(ctx &Context) ?User {
 		return none
 	}
 
-	if !compare_password_with_hash(password, user.salt, user.password) {
+	if !app.git_http_credential_is_valid(user, credential, require_write) {
 		return none
 	}
 	return user
+}
+
+// Git clients cannot complete the browser TOTP challenge. A personal access
+// token is therefore required when 2FA is enabled. Tokens are also accepted
+// for accounts without 2FA, while their existing account passwords continue
+// to work.
+fn (mut app App) git_http_credential_is_valid(user User, credential string, require_write bool) bool {
+	required_scope := if require_write {
+		api_token_scope_write_repository
+	} else {
+		api_token_scope_read_repository
+	}
+	if credential.starts_with('glt_') {
+		return app.api_token_authenticates_user(credential, user.id, required_scope)
+	}
+	if app.user_has_two_factor(user.id) {
+		return false
+	}
+	return compare_password_with_hash(credential, user.salt, user.password)
 }
 
 fn (mut app Context) set_no_cache_headers() {

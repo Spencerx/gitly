@@ -11,10 +11,13 @@ import config
 import git
 
 const commits_per_page = 35
+const default_primary_branch = 'main'
 const posts_per_day = 5
 const max_username_len = 40
 const max_password_len = 128
 const max_login_attempts = 5
+const login_attempt_window_seconds = 15 * 60
+const login_throttle_seconds = 15 * 60
 const max_user_repos = 10
 const max_repo_name_len = 100
 const max_repo_description_len = 500
@@ -93,8 +96,17 @@ fn new_app() !&App {
 
 	set_rand_crypto_safe_seed()
 
+	mut migration_lock := db_acquire_migration_lock(mut app.db)!
+	mut migrations_committed := false
+	defer {
+		if !migrations_committed {
+			migration_lock.rollback() or {}
+		}
+	}
 	app.create_tables()!
 	app.migrate_tables()!
+	migration_lock.commit()!
+	migrations_committed = true
 
 	create_directory_if_not_exists('logs')
 
@@ -119,9 +131,6 @@ fn new_app() !&App {
 	app.mount_static_folder_at(app.config.avatars_path, '/avatars')!
 
 	app.load_settings()
-
-	// Create the first admin user if the db is empty
-	app.get_user_by_id(1) or {}
 
 	if '-cmdapi' in os.args {
 		spawn app.command_fetcher()
@@ -277,10 +286,12 @@ pub fn (mut app App) index(mut ctx Context) veb.Result {
 
 @['/change_lang/:lang'; post]
 pub fn (mut app App) change_lang(lang string) veb.Result {
-	eprintln('CHANGING LANG ${lang}')
+	if lang !in ['en', 'ru', 'es', 'jp', 'cn', 'pt'] {
+		ctx.res.set_status(.bad_request)
+		return ctx.json_error('Unsupported language')
+	}
 	expire_date := time.now().add_days(400)
 	ctx.set_cookie(name: 'lang', value: lang, path: '/', expires: expire_date)
-	// return ctx.redirect('/')
 	return ctx.json('ok')
 }
 
@@ -400,6 +411,9 @@ fn (mut app App) create_tables() ! {
 	}!
 	sql app.db {
 		create table IssueLabel
+	}!
+	sql app.db {
+		create table IssueAssignee
 	}!
 	//"created_at int default (strftime('%s', 'now'))"
 	sql app.db {
@@ -529,6 +543,11 @@ fn (mut app App) create_tables() ! {
 }
 
 fn (mut app App) migrate_tables() ! {
+	app.add_missing_column('User', 'github_id', 'BIGINT NOT NULL DEFAULT 0')!
+	app.add_missing_column('User', 'login_attempts', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('User', 'login_attempt_window_started_at', 'BIGINT NOT NULL DEFAULT 0')!
+	app.add_missing_column('User', 'login_throttled_until', 'BIGINT NOT NULL DEFAULT 0')!
+	app.add_missing_column('User', 'is_bootstrap_admin', db_bool_column_type())!
 	app.add_missing_column('File', 'is_size_calculated', db_bool_column_type())!
 	app.add_missing_column('Settings', 'disable_tree_folder_size', db_bool_column_type())!
 	app.add_missing_column('Settings', 'governance_backfilled', db_bool_column_type())!
@@ -540,6 +559,7 @@ fn (mut app App) migrate_tables() ! {
 	app.add_missing_column('Repo', 'is_pinned', db_bool_column_type())!
 	app.add_missing_column('Repo', 'created_at', 'INTEGER NOT NULL DEFAULT 0')!
 	app.add_missing_column('Repo', 'required_approvals', 'INTEGER NOT NULL DEFAULT 0')!
+	app.add_missing_column('Issue', 'status', 'INTEGER NOT NULL DEFAULT 0')!
 	app.add_missing_column('SshKey', 'fingerprint', "TEXT NOT NULL DEFAULT ''")!
 	app.add_missing_column('SshKey', 'usage_type', "TEXT NOT NULL DEFAULT 'auth'")!
 	app.add_missing_column('SshKey', 'expires_at', 'INTEGER NOT NULL DEFAULT 0')!
@@ -548,10 +568,19 @@ fn (mut app App) migrate_tables() ! {
 	app.add_missing_column('PullRequest', 'merged_at', 'INTEGER NOT NULL DEFAULT 0')!
 	app.add_missing_column('PullRequest', 'merge_commit_hash', "TEXT NOT NULL DEFAULT ''")!
 	app.add_missing_column('PullRequest', 'head_repo_id', 'INTEGER NOT NULL DEFAULT 0')!
+	// Existing approvals predate head-SHA binding. Leave them unbound so a
+	// freshly-pushed head must be approved explicitly instead of silently
+	// inheriting an approval for unknown code.
+	app.add_missing_column('PrApproval', 'approved_head_oid', "TEXT NOT NULL DEFAULT ''")!
 	app.add_missing_column('RepoMirror', 'encrypted_ssh_key', "TEXT NOT NULL DEFAULT ''")!
 	app.add_missing_column('RepoMirror', 'ssh_known_hosts', "TEXT NOT NULL DEFAULT ''")!
 	app.add_missing_column('Token', 'created_at', 'INTEGER NOT NULL DEFAULT 0')!
 	app.add_missing_column('Token', 'expires_at', 'INTEGER NOT NULL DEFAULT 0')!
+	// Tokens created before scopes/expiry existed retain their historical full
+	// access and no-expiry behavior. Every newly issued UI token supplies both
+	// columns explicitly and is bounded to at most one year.
+	app.add_missing_column('ApiToken', 'scopes', "TEXT NOT NULL DEFAULT 'api'")!
+	app.add_missing_column('ApiToken', 'expires_at', 'INTEGER NOT NULL DEFAULT 0')!
 	app.backfill_repo_created_at()!
 	app.backfill_default_branch_protection_once()!
 	app.clear_legacy_local_github_usernames()!
@@ -562,6 +591,33 @@ fn (mut app App) migrate_tables() ! {
 	app.db.exec('create unique index if not exists idx_repo_owner_name_active on ${sql_table('Repo')} (user_name, name) where is_deleted is false')!
 	app.db.exec('create index if not exists idx_repo_fork_source on ${sql_table('RepoFork')} (source_repo_id, created_at desc)')!
 	app.db.exec('create index if not exists idx_repo_mirror_due on ${sql_table('RepoMirror')} (enabled, next_update_at)')!
+	app.db.exec('create index if not exists idx_issue_assignee_user on ${sql_table('IssueAssignee')} (user_id, issue_id)')!
+	app.db.exec('create index if not exists idx_api_token_hash on ${sql_table('ApiToken')} (token_hash)')!
+	app.db.exec('create index if not exists idx_pr_approval_head on ${sql_table('PrApproval')} (pr_id, approved_head_oid)')!
+	app.db.exec('create unique index if not exists idx_user_github_id on ${sql_table('User')} (${sql_table('github_id')}) where ${sql_table('github_id')} > 0')!
+	app.db.exec('create unique index if not exists idx_user_single_bootstrap_admin on ${sql_table('User')} (${sql_table('is_bootstrap_admin')}) where ${sql_table('is_bootstrap_admin')} is true')!
+	app.backfill_bootstrap_administrator()!
+}
+
+// Existing installations have already passed bootstrap. Preserve their
+// administrator choice when possible; if the historical race left an install
+// with no administrator, promote its oldest registered account. This also
+// makes the migration self-healing after an interrupted first registration.
+fn (mut app App) backfill_bootstrap_administrator() ! {
+	app.db.exec('update ${sql_table('User')} set
+		${sql_table('is_admin')} = true,
+		${sql_table('is_bootstrap_admin')} = true
+		where ${sql_table('id')} = (
+			select ${sql_table('id')} from ${sql_table('User')}
+			where ${sql_table('is_registered')} is true
+			order by case when ${sql_table('is_admin')} is true then 0 else 1 end,
+				${sql_table('id')} asc
+			limit 1
+		)
+		and not exists (
+			select 1 from ${sql_table('User')}
+			where ${sql_table('is_bootstrap_admin')} is true
+		)')!
 }
 
 fn (mut app App) clear_legacy_local_github_usernames() ! {
@@ -594,7 +650,16 @@ fn (mut app App) add_missing_column(table_name string, column_name string, colum
 		return
 	}
 
-	app.db.exec('alter table ${sql_table(table_name)} add column ${sql_table(column_name)} ${column_type}')!
+	app.db.exec('alter table ${sql_table(table_name)} add column ${sql_table(column_name)} ${column_type}') or {
+		alter_err := err
+		// A non-Gitly migrator or an older process which predates the migration
+		// lock can still win after our initial check. Treat the ALTER as idempotent
+		// only when an authoritative recheck confirms that exact column now exists.
+		if db_column_exists(mut app.db, table_name, column_name) or { false } {
+			return
+		}
+		return alter_err
+	}
 }
 
 fn (mut ctx Context) json_success[T](result T) veb.Result {

@@ -3,6 +3,7 @@ module main
 import config
 import db.pg
 import os
+import orm
 
 type GitlyDb = pg.DB
 
@@ -34,8 +35,40 @@ fn db_exec_values(mut db GitlyDb, query string) ![][]string {
 	return values
 }
 
-fn db_last_insert_id(mut db GitlyDb) int {
-	return db.last_id()
+fn db_exec_param_values(mut db GitlyDb, query string, params []string) ![][]string {
+	rows := db.exec_param_many(query, params)!
+	mut values := [][]string{cap: rows.len}
+	for row in rows {
+		values << row.values()
+	}
+	return values
+}
+
+fn db_parameter_marker(index int) string {
+	return '$${index + 1}'
+}
+
+fn db_bool_value(value bool) string {
+	return value.str()
+}
+
+fn db_begin_transaction(mut db GitlyDb) !orm.Tx {
+	// pg.DB is pool-backed. pg.Tx owns one checked-out connection, while its
+	// orm_begin method is intentionally a no-op because begin() already ran.
+	mut pinned := db.begin()!
+	return orm.begin(mut pinned)
+}
+
+// The transaction pins the connection which owns this advisory lock. Schema
+// work can continue through the pool: every Gitly instance uses the same global
+// key and must wait for the current migrator to commit or disconnect.
+fn db_acquire_migration_lock(mut db GitlyDb) !orm.Tx {
+	mut tx := db_begin_transaction(mut db)!
+	tx.execute('select pg_advisory_xact_lock(7177956983026489)') or {
+		tx.rollback() or {}
+		return err
+	}
+	return tx
 }
 
 fn db_column_exists(mut db GitlyDb, table_name string, column_name string) !bool {

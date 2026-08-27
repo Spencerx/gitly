@@ -6,11 +6,11 @@ import api
 @['/api/v1/:user/:repo_name/branches/count']
 fn (mut app App) handle_branch_count(username string, repo_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 	caller := app.api_user_from_ctx(ctx) or { User{} }
 	if !app.user_has_repo_read_access(caller.id, repo) {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 
 	count := app.get_count_repo_branches(repo.id)

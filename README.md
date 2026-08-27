@@ -9,9 +9,9 @@ It provides:
 - Multiple users, personal and organization repositories, and public/private visibility
 - Git clone, fetch, and push over HTTP(S) and OpenSSH
 - Repository browsing, syntax highlighting, Markdown rendering, language statistics, and a “Top files” view
-- Issues, merge requests with reviews, required approvals, squash/merge support, discussions, projects, milestones, releases, stars, and watches
+- Issues with assignees, merge requests with reviews, required approvals, squash/merge support, discussions, projects, milestones, releases, stars, and watches
 - Reporter/Developer/Maintainer project roles and protected branches with wildcard rules, push/merge controls, deletion protection, and force-push rejection
-- Webhooks, API tokens, two-factor authentication, security logs, and optional CI integration
+- Webhooks, scoped/expiring personal access tokens, two-factor authentication, security logs, and optional CI integration
 - Repository forks with upstream synchronization and cross-fork merge requests
 - Scheduled/manual pull and push mirrors over HTTPS or SSH, with encrypted credentials
 - SQLite or PostgreSQL storage and compiled-in templates
@@ -22,7 +22,7 @@ The current GitLab capability comparison and the remaining implementation sequen
 
 ## Build and run
 
-A recent V compiler, Git, and a C compiler are required. `sassc` is optional because the build script can download a prebuilt stylesheet. The Markdown module is included in this repository.
+A recent V compiler, Git, and a C compiler are required. Install `sassc` to compile the stylesheet on a clean checkout; the build intentionally does not download unpinned generated assets. The Markdown module is included in this repository.
 
 Build with:
 
@@ -50,7 +50,7 @@ System libraries:
 
 - SQLite: `libsqlite3-dev` on Ubuntu/Debian
 - PostgreSQL: `libpq-dev` on Ubuntu/Debian or `brew install libpq` on macOS
-- Optional stylesheet compilation: `sassc`
+- Stylesheet compilation: `sassc`
 
 ## Production configuration
 
@@ -59,8 +59,10 @@ Review `config.json` before deployment:
 - Set `hostname` to the public host.
 - Set `cookie_secure` to `true` whenever the site is served over HTTPS.
 - Set `ci_secret` to a long random value if CI is enabled, and configure the same secret in the CI service. CI callbacks are rejected when this secret is empty. `GITLY_CI_SECRET` can override the Gitly-side value.
+- Gitly derives the CI status callback from `hostname` and `cookie_secure`. If the CI service cannot reach that URL, set `ci_callback_url` (or `GITLY_CI_CALLBACK_URL`) to the complete externally reachable callback endpoint, for example `https://git.example.com/api/v1/ci/status`.
 - Set `GITLY_STORAGE_SECRET` to a long random value before saving credentialed repository mirrors. Mirror passwords, access tokens, and SSH private keys fail closed when encryption is not configured.
 - Keep the CI service and database on trusted networks and terminate HTTPS at Gitly or a reverse proxy.
+- Treat CI jobs as untrusted code. Run the separate `gitly_ci` service on an isolated runner host/VM (or an equivalent container sandbox) with a minimal allowlisted environment and no access to Gitly's database credentials, storage secret, repository storage, or host filesystem beyond its disposable workspace. Do not co-locate the current shell runner with the Gitly service in production.
 
 ### SSH transport
 

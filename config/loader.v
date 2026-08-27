@@ -10,7 +10,11 @@ pub:
 	avatars_path      string
 	hostname          string
 	ci_service_url    string
-	usdt_wallet       string
+	// ci_callback_url is the externally reachable callback endpoint handed to
+	// the CI service. When empty, Gitly derives it from hostname and
+	// cookie_secure.
+	ci_callback_url string
+	usdt_wallet     string
 	// ci_secret is the shared secret used to authenticate CI status callbacks
 	// from gitly_ci (HMAC-SHA256 over the request body). Must match gitly_ci's
 	// ci_secret. When empty, callbacks fail closed.
@@ -57,6 +61,7 @@ pub fn read_config(path string) !Config {
 		avatars_path:             env_or('GITLY_AVATARS_PATH', base.avatars_path)
 		hostname:                 env_or('GITLY_HOSTNAME', base.hostname)
 		ci_service_url:           env_or('GITLY_CI_SERVICE_URL', base.ci_service_url)
+		ci_callback_url:          env_or('GITLY_CI_CALLBACK_URL', base.ci_callback_url)
 		usdt_wallet:              base.usdt_wallet
 		ci_secret:                env_or('GITLY_CI_SECRET', base.ci_secret)
 		cookie_secure:            base.cookie_secure

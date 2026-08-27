@@ -931,6 +931,28 @@ form {
 	gap: 10px;
 }
 
+.general-settings-form {
+	flex-direction: column;
+	align-items: stretch;
+
+	label {
+		font-size: 13px;
+		font-weight: 600;
+	}
+
+	textarea,
+	select,
+	input[type="text"] {
+		box-sizing: border-box;
+		width: 100%;
+		max-width: 680px;
+	}
+
+	.settings-form__submit {
+		align-self: flex-start;
+	}
+}
+
 .features-form__option {
 	display: flex;
 	align-items: center;

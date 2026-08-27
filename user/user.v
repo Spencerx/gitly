@@ -15,6 +15,7 @@ struct User {
 	full_name       string
 	username        string @[unique]
 	github_username string
+	github_id       i64
 	password        string
 	salt            string
 	created_at      time.Time
@@ -25,13 +26,16 @@ struct User {
 	oauth_state     string @[skip]
 mut:
 	// for github oauth XSRF protection
-	namechanges_count    int
-	last_namechange_time int
-	posts_count          int
-	last_post_time       int
-	avatar               string
-	emails               []Email @[skip]
-	login_attempts       int
+	namechanges_count               int
+	last_namechange_time            int
+	posts_count                     int
+	last_post_time                  int
+	avatar                          string
+	emails                          []Email @[skip]
+	login_attempts                  int
+	login_attempt_window_started_at i64
+	login_throttled_until           i64
+	is_bootstrap_admin              bool
 }
 
 struct Email {
@@ -56,6 +60,35 @@ pub fn (mut app App) set_user_admin_status(user_id int, status bool) ! {
 	sql app.db {
 		update User set is_admin = status where id == user_id
 	}!
+}
+
+// claim_bootstrap_administrator atomically promotes one registered user on a
+// fresh installation. The partial unique index created by migrate_tables is
+// the final arbiter when registrations race: at most one UPDATE can set the
+// bootstrap marker, while is_admin itself remains unconstrained for admins
+// added later through normal administration.
+fn (mut app App) claim_bootstrap_administrator(user_id int) !bool {
+	if user_id <= 0 {
+		return false
+	}
+	rows := db_exec_values(mut app.db, 'update ${sql_table('User')} set
+		${sql_table('is_admin')} = true,
+		${sql_table('is_bootstrap_admin')} = true
+		where ${sql_table('id')} = ${user_id}
+			and ${sql_table('is_registered')} is true
+			and not exists (
+				select 1 from ${sql_table('User')}
+				where ${sql_table('is_bootstrap_admin')} is true
+			)
+		returning ${sql_table('id')}') or {
+		// PostgreSQL can let two statements reach the unique index together;
+		// the loser is an expected non-claim, not a registration failure.
+		if is_unique_constraint_error(err) {
+			return false
+		}
+		return err
+	}
+	return rows.len == 1 && rows[0].len == 1 && rows[0][0].int() == user_id
 }
 
 // hash_password_with_salt returns a bcrypt hash of the password. bcrypt
@@ -116,9 +149,6 @@ pub fn (mut app App) register_user(username string, password string, salt string
 	if !validation.is_username_valid(account_name) || is_reserved_account_name(account_name) {
 		return error('username `${account_name}` is not available')
 	}
-	if _ := app.get_org_by_name(account_name) {
-		return error('username `${account_name}` is already taken')
-	}
 
 	mut clean_emails := []string{cap: emails.len}
 	for raw_email in emails {
@@ -129,7 +159,28 @@ pub fn (mut app App) register_user(username string, password string, salt string
 		clean_emails << email
 	}
 
-	username_user := app.get_user_by_username(account_name) or { User{} }
+	// Keep the account row and every address in one pinned transaction. A
+	// uniqueness failure on any later email must release the username and roll
+	// back emails inserted earlier in this registration.
+	mut tx := db_begin_transaction(mut app.db)!
+	mut committed := false
+	defer {
+		if !committed {
+			tx.rollback() or {}
+		}
+	}
+
+	orgs := sql tx {
+		select from Org where name == account_name limit 1
+	}!
+	if orgs.len > 0 {
+		return error('username `${account_name}` is already taken')
+	}
+
+	username_users := sql tx {
+		select from User where username == account_name limit 1
+	}!
+	username_user := if username_users.len == 1 { username_users[0] } else { User{} }
 	if username_user.id != 0 && username_user.is_registered {
 		return error('username `${account_name}` is already taken')
 	}
@@ -138,8 +189,12 @@ pub fn (mut app App) register_user(username string, password string, salt string
 	}
 
 	for email in clean_emails {
-		if email_user := app.get_user_by_email(email) {
-			if email_user.id != username_user.id {
+		candidate_email := email
+		matching_emails := sql tx {
+			select from Email where email == candidate_email limit 1
+		}!
+		if matching_emails.len == 1 {
+			if matching_emails[0].user_id != username_user.id {
 				return error('email `${email}` is already in use')
 			}
 		}
@@ -150,26 +205,35 @@ pub fn (mut app App) register_user(username string, password string, salt string
 	// to an existing password account with the same name.
 	if username_user.id != 0 {
 		for email in clean_emails {
-			if !app.email_exists(email) {
-				app.add_email(username_user.id, email)!
+			candidate_email := email
+			matching_emails := sql tx {
+				select from Email where email == candidate_email limit 1
+			}!
+			if matching_emails.len == 0 {
+				user_email := Email{
+					user_id: username_user.id
+					email:   candidate_email
+				}
+				sql tx {
+					insert user_email into Email
+				} or {
+					if is_unique_constraint_error(err) {
+						return error('email `${candidate_email}` is already in use')
+					}
+					return err
+				}
 			}
 		}
 		id := username_user.id
-		sql app.db {
+		sql tx {
 			update User set is_registered = true, is_github = true, github_username = account_name
 			where id == id
 		}!
+		tx.commit()!
+		committed = true
 		app.add_activity(id, 'joined') or { app.info('could not record joined activity: ${err}') }
 		app.create_user_dir(account_name)
 		return true
-	}
-
-	// A final all-address check narrows the race window before insertion. The
-	// unique database constraints remain authoritative if requests race.
-	for email in clean_emails {
-		if app.email_exists(email) {
-			return error('email `${email}` is already in use')
-		}
 	}
 
 	user := User{
@@ -184,24 +248,38 @@ pub fn (mut app App) register_user(username string, password string, salt string
 		is_admin:        is_admin
 	}
 
-	app.add_user(user) or {
+	sql tx {
+		insert user into User
+	} or {
 		if is_unique_constraint_error(err) {
 			return error('username `${account_name}` or email `${clean_emails[0]}` is already in use')
 		}
 		return err
 	}
 
-	created := app.get_user_by_username(account_name) or {
+	created_users := sql tx {
+		select from User where username == account_name limit 1
+	}!
+	if created_users.len != 1 {
 		return error('user `${account_name}` was not found after insert')
 	}
+	created := created_users[0]
 	for email in clean_emails {
-		app.add_email(created.id, email) or {
+		user_email := Email{
+			user_id: created.id
+			email:   email
+		}
+		sql tx {
+			insert user_email into Email
+		} or {
 			if is_unique_constraint_error(err) {
 				return error('email `${email}` is already in use')
 			}
 			return err
 		}
 	}
+	tx.commit()!
+	committed = true
 	app.add_activity(created.id, 'joined') or {
 		app.info('could not record joined activity: ${err}')
 	}
@@ -327,6 +405,23 @@ pub fn (mut app App) get_user_by_github_username(name string) ?User {
 	return user
 }
 
+pub fn (mut app App) get_user_by_github_id(github_id i64) ?User {
+	if github_id <= 0 {
+		return none
+	}
+	users := sql app.db {
+		select from User where github_id == github_id limit 1
+	} or { [] }
+
+	if users.len == 0 {
+		return none
+	}
+
+	mut user := users.first()
+	user.emails = app.find_user_emails(user.id)
+	return user
+}
+
 pub fn (mut app App) get_user_by_email(value string) ?User {
 	emails := sql app.db {
 		select from Email where email == value
@@ -414,35 +509,70 @@ pub fn (mut app App) contains_contributor(user_id int, repo_id int) bool {
 }
 
 pub fn (mut app App) increment_user_post(mut user User) ! {
-	user.posts_count++
-
-	u := *user
-	id := u.id
+	id := user.id
 	now := int(time.now().unix())
-	lastplus := int(time.unix(u.last_post_time).add_days(1).unix())
 
-	if now >= lastplus {
+	if user_post_window_expired(user, now) {
+		user.posts_count = 0
 		user.last_post_time = now
 		sql app.db {
 			update User set posts_count = 0, last_post_time = now where id == id
 		}!
 	}
 
+	user.posts_count++
 	sql app.db {
 		update User set posts_count = posts_count + 1 where id == id
 	}!
 }
 
-pub fn (mut app App) increment_user_login_attempts(user_id int) ! {
+fn user_post_window_expired(user User, now int) bool {
+	return user.last_post_time <= 0
+		|| now >= user.last_post_time + int(24 * time.hour / time.second)
+}
+
+fn user_reached_post_limit(user User, now int) bool {
+	return !user_post_window_expired(user, now) && user.posts_count >= posts_per_day
+}
+
+// record_failed_login advances the persisted per-account throttle in one SQL
+// statement. Keeping the calculation in the database prevents simultaneous
+// failures from losing increments and means a process restart cannot clear the
+// window. Attempts made while throttled do not extend the throttle indefinitely.
+pub fn (mut app App) record_failed_login(user_id int, now i64) ! {
+	window_cutoff := now - login_attempt_window_seconds
+	throttled_until := now + login_throttle_seconds
+	app.db.exec('update ${sql_table('User')} set
+		${sql_table('login_attempts')} = case
+			when ${sql_table('login_throttled_until')} > ${now} then ${sql_table('login_attempts')}
+			when ${sql_table('login_attempt_window_started_at')} <= ${window_cutoff} then 1
+			else ${sql_table('login_attempts')} + 1
+		end,
+		${sql_table('login_attempt_window_started_at')} = case
+			when ${sql_table('login_throttled_until')} > ${now} then ${sql_table('login_attempt_window_started_at')}
+			when ${sql_table('login_attempt_window_started_at')} <= ${window_cutoff} then ${now}
+			else ${sql_table('login_attempt_window_started_at')}
+		end,
+		${sql_table('login_throttled_until')} = case
+			when ${sql_table('login_throttled_until')} > ${now} then ${sql_table('login_throttled_until')}
+			when ${sql_table('login_attempt_window_started_at')} <= ${window_cutoff} then 0
+			when ${sql_table('login_attempts')} + 1 >= ${max_login_attempts} then ${throttled_until}
+			else 0
+		end
+		where ${sql_table('id')} = ${user_id}')!
+}
+
+pub fn (mut app App) reset_user_login_throttle(user_id int) ! {
+	zero_attempts := 0
+	zero_time := i64(0)
 	sql app.db {
-		update User set login_attempts = login_attempts + 1 where id == user_id
+		update User set login_attempts = zero_attempts, login_attempt_window_started_at = zero_time,
+		login_throttled_until = zero_time where id == user_id
 	}!
 }
 
-pub fn (mut app App) update_user_login_attempts(user_id int, attempts int) ! {
-	sql app.db {
-		update User set login_attempts = attempts where id == user_id
-	}!
+fn user_login_is_throttled(user User, now i64) bool {
+	return user.login_throttled_until > now
 }
 
 pub fn (mut app App) check_user_blocked(user_id int) bool {
@@ -451,26 +581,62 @@ pub fn (mut app App) check_user_blocked(user_id int) bool {
 }
 
 fn (mut app App) change_username(user_id int, old_username string, username string) ! {
-	sql app.db {
-		update User set username = username where id == user_id
+	if user_id <= 0 || old_username == '' || username == '' || old_username == username {
+		return error('invalid username change')
+	}
+	target_user_id := user_id
+	old_name := old_username
+	mut tx := db_begin_transaction(mut app.db)!
+	mut committed := false
+	defer {
+		if !committed {
+			tx.rollback() or {}
+		}
+	}
+	repos := sql tx {
+		select from Repo where user_id == target_user_id && user_name == old_name
 	}!
+	for repo in repos {
+		new_git_dir := if repo.git_dir == '' {
+			''
+		} else {
+			rebase_user_repo_git_dir(app.config.repo_storage_path, old_username, username,
+				repo.git_dir)!
+		}
+		repo_id := repo.id
+		sql tx {
+			update Repo set user_name = username, git_dir = new_git_dir where id == repo_id
+		}!
+	}
+	now := int(time.now().unix())
+	sql tx {
+		update User set username = username, namechanges_count = namechanges_count + 1, last_namechange_time = now
+		where id == target_user_id
+	}!
+	tx.commit()!
+	committed = true
+}
 
-	sql app.db {
-		update Repo set user_name = username where user_id == user_id && user_name == old_username
-	}!
+fn rebase_user_repo_git_dir(storage_root string, old_username string, new_username string, git_dir string) !string {
+	old_owner_abs :=
+		os.abs_path(os.join_path(storage_root, old_username)).trim_right(os.path_separator)
+	repo_abs := os.abs_path(git_dir).trim_right(os.path_separator)
+	old_prefix := old_owner_abs + os.path_separator
+	if repo_abs == old_owner_abs || !repo_abs.starts_with(old_prefix) {
+		return error('repository path is outside the user storage directory')
+	}
+	relative_repo_path := repo_abs[old_prefix.len..]
+	new_storage_root := if os.is_abs_path(git_dir) {
+		os.abs_path(storage_root)
+	} else {
+		storage_root
+	}
+	return os.join_path(new_storage_root, new_username, relative_repo_path)
 }
 
 fn (mut app App) change_full_name(user_id int, full_name string) ! {
 	sql app.db {
 		update User set full_name = full_name where id == user_id
-	}!
-}
-
-fn (mut app App) incement_namechanges(user_id int) ! {
-	now := int(time.now().unix())
-	sql app.db {
-		update User set namechanges_count = namechanges_count + 1, last_namechange_time = now
-		where id == user_id
 	}!
 }
 
@@ -484,7 +650,7 @@ fn (mut app App) check_username(username string) (bool, User) {
 
 pub fn (mut app App) auth_user(mut ctx Context, user User, ip string) ! {
 	token := app.add_token(user.id, ip)!
-	app.update_user_login_attempts(user.id, 0)!
+	app.reset_user_login_throttle(user.id)!
 	expire_date := time.now().add_seconds(session_ttl)
 	// HttpOnly keeps the session token out of reach of JavaScript (so an XSS
 	// payload can't steal it); SameSite=Lax stops the cookie from riding along

@@ -43,14 +43,12 @@ pub fn (mut app App) handle_admin_edit_user(user_id string) veb.Result {
 	is_blocked := 'is-blocked' in ctx.form
 	is_admin := 'is-admin' in ctx.form
 	target_id := user_id.int()
-	target := app.get_user_by_id(target_id) or { return ctx.not_found() }
-	if target.is_admin && !target.is_blocked && (!is_admin || is_blocked)
-		&& app.count_admin_users() <= 1 {
-		ctx.error('The site must keep at least one active administrator')
+	app.get_user_by_id(target_id) or { return ctx.not_found() }
+
+	app.edit_user(target_id, clear_session, is_blocked, is_admin) or {
+		ctx.error(err.msg())
 		return app.admin_users(mut ctx, '0')
 	}
-
-	app.edit_user(target_id, clear_session, is_blocked, is_admin) or { app.info(err.str()) }
 
 	return ctx.redirect('/admin')
 }

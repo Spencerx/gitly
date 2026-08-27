@@ -38,11 +38,11 @@ registerForm.addEventListener("submit", async (event) => {
 
   const body = (await response.text()).trim();
 
-  if (response.ok && body === "ok") {
-    const username = data.get("username");
-    window.location.href = "/" + username;
-    return;
-  }
+	if (response.ok && body === "ok") {
+		const username = String(data.get("username") || "").trim().toLowerCase();
+		window.location.href = "/" + encodeURIComponent(username);
+		return;
+	}
 
   showRegisterError(body || "Failed to register");
   registerSubmit.disabled = false;

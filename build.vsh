@@ -1,12 +1,21 @@
-import net.http
+import os
 
 path := 'static/css/gitly.css'
-if !exists(path) {
-	ret := system('sassc static/css/gitly.scss > ${path}')
-	if ret != 0 {
-		http.download_file('https://gitly.org/css/gitly.css', path)!
-		println('No sassc detected on this system, gitly.css has been downloaded from gitly.org.')
+source := 'static/css/gitly.scss'
+if sassc := os.find_abs_path_of_executable('sassc') {
+	result := os.exec([sassc, source])
+	if result.exit_code != 0 {
+		eprintln('Could not compile ${source}: ${result.output}')
+		exit(1)
 	}
+	// Write only after sassc succeeds, so a compiler failure cannot truncate a
+	// previously usable stylesheet.
+	os.write_file(path, result.output)!
+} else if !os.exists(path) || os.file_size(path) == 0 {
+	eprintln('sassc is required to compile ${source}; refusing to download unpinned build output')
+	exit(1)
+} else {
+	eprintln('sassc was not found; using the existing ${path}')
 }
 
 ret := system('v .')

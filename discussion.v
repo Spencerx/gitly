@@ -51,18 +51,19 @@ fn (c &DiscussionComment) relative() string {
 }
 
 fn (mut app App) add_discussion(repo_id int, author_id int, title string, body string, category string) !int {
-	d := Discussion{
-		repo_id:    repo_id
-		author_id:  author_id
-		title:      title
-		body:       body
-		category:   category
-		created_at: int(time.now().unix())
-	}
-	sql app.db {
-		insert d into Discussion
-	}!
-	return db_last_insert_id(mut app.db)
+	return db_insert_returning_id(mut app.db, 'Discussion', ['repo_id', 'author_id', 'title', 'body',
+		'category', 'is_locked', 'is_answered', 'answer_id', 'comments_count', 'created_at'], [
+		repo_id.str(),
+		author_id.str(),
+		title,
+		body,
+		category,
+		db_bool_value(false),
+		db_bool_value(false),
+		'0',
+		'0',
+		int(time.now().unix()).str(),
+	])
 }
 
 fn (mut app App) find_discussion(id int) ?Discussion {

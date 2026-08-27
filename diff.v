@@ -85,10 +85,8 @@ fn parse_unified_diff(raw string) []FileDiff {
 			cur_hunk = DiffHunk{}
 			in_file = true
 			in_hunk = false
-			parts := line.split(' ')
-			if parts.len >= 4 {
-				a_path := strip_diff_prefix(parts[2], 'a/')
-				b_path := strip_diff_prefix(parts[3], 'b/')
+			a_path, b_path := parse_diff_git_paths(line)
+			if a_path != '' || b_path != '' {
 				cur.old_path = a_path
 				cur.path = b_path
 			}
@@ -96,12 +94,31 @@ fn parse_unified_diff(raw string) []FileDiff {
 			cur.is_new = true
 		} else if line.starts_with('deleted file') {
 			cur.is_deleted = true
-		} else if line.starts_with('rename from') || line.starts_with('rename to') {
+		} else if line.starts_with('rename from ') {
 			cur.is_renamed = true
+			cur.old_path = parse_diff_path_value(line['rename from '.len..])
+		} else if line.starts_with('rename to ') {
+			cur.is_renamed = true
+			cur.path = parse_diff_path_value(line['rename to '.len..])
 		} else if line.starts_with('Binary files') {
 			cur.is_binary = true
-		} else if line.starts_with('--- ') || line.starts_with('+++ ') {
-			// skip header lines
+			old_path, new_path := parse_binary_diff_paths(line)
+			if old_path != '' && old_path != '/dev/null' {
+				cur.old_path = strip_diff_prefix(old_path, 'a/')
+			}
+			if new_path != '' && new_path != '/dev/null' {
+				cur.path = strip_diff_prefix(new_path, 'b/')
+			}
+		} else if line.starts_with('--- ') {
+			old_path := parse_diff_marker_path(line[4..])
+			if old_path != '/dev/null' {
+				cur.old_path = strip_diff_prefix(old_path, 'a/')
+			}
+		} else if line.starts_with('+++ ') {
+			new_path := parse_diff_marker_path(line[4..])
+			if new_path != '/dev/null' {
+				cur.path = strip_diff_prefix(new_path, 'b/')
+			}
 		} else if line.starts_with('@@') {
 			if in_hunk {
 				cur.hunks << cur_hunk
@@ -153,6 +170,142 @@ fn parse_unified_diff(raw string) []FileDiff {
 		files << cur
 	}
 	return files
+}
+
+// Git's `diff --git` header is not shell-tokenized: ordinary paths containing
+// spaces are emitted without quotes. The ` b/` boundary is therefore the only
+// delimiter available in that header. Later ---/+++, rename, and binary
+// headers carry authoritative paths and replace these provisional values.
+fn parse_diff_git_paths(line string) (string, string) {
+	prefix := 'diff --git '
+	if !line.starts_with(prefix) {
+		return '', ''
+	}
+	rest := line[prefix.len..]
+	if rest.starts_with('"') {
+		old_value, next := parse_git_quoted_path_at(rest, 0)
+		new_value, _ := parse_git_quoted_path_at(rest, next)
+		return strip_diff_prefix(old_value, 'a/'), strip_diff_prefix(new_value, 'b/')
+	}
+	separator := rest.index(' b/') or { return '', '' }
+	return strip_diff_prefix(rest[..separator], 'a/'), strip_diff_prefix(rest[separator + 1..],
+		'b/')
+}
+
+fn parse_diff_marker_path(value string) string {
+	if value.starts_with('"') {
+		path, _ := parse_git_quoted_path_at(value, 0)
+		return path
+	}
+	// Traditional unified diffs may append a timestamp after a tab. Git also
+	// appends a tab for an unquoted path containing spaces.
+	return value.all_before('\t')
+}
+
+fn parse_diff_path_value(value string) string {
+	if value.starts_with('"') {
+		path, _ := parse_git_quoted_path_at(value, 0)
+		return path
+	}
+	return value
+}
+
+fn parse_binary_diff_paths(line string) (string, string) {
+	prefix := 'Binary files '
+	suffix := ' differ'
+	if !line.starts_with(prefix) || !line.ends_with(suffix) {
+		return '', ''
+	}
+	rest := line[prefix.len..line.len - suffix.len]
+	if rest.starts_with('"') {
+		old_value, next := parse_git_quoted_path_at(rest, 0)
+		and_at := rest.index_after_(' and ', next)
+		if and_at < 0 {
+			return '', ''
+		}
+		new_value, _ := parse_git_quoted_path_at(rest, and_at + ' and '.len)
+		return old_value, new_value
+	}
+	separator := rest.index(' and b/') or {
+		separator_null := rest.index(' and /dev/null') or { return '', '' }
+		return rest[..separator_null], rest[separator_null + ' and '.len..]
+	}
+	return rest[..separator], rest[separator + ' and '.len..]
+}
+
+// Git double-quotes unusual paths using C-style escapes. Decode the escapes so
+// paths used by the file tree, syntax highlighter, and inline-comment keys all
+// refer to the real repository path.
+fn parse_git_quoted_path_at(value string, start int) (string, int) {
+	mut i := start
+	for i < value.len && value[i] == ` ` {
+		i++
+	}
+	if i >= value.len || value[i] != `"` {
+		end := value.index_after_(' ', i)
+		if end < 0 {
+			return value[i..], value.len
+		}
+		return value[i..end], end
+	}
+	i++
+	mut decoded := []u8{cap: value.len - i}
+	for i < value.len {
+		ch := value[i]
+		if ch == `"` {
+			return decoded.bytestr(), i + 1
+		}
+		if ch != `\\` || i + 1 >= value.len {
+			decoded << ch
+			i++
+			continue
+		}
+		i++
+		escaped := value[i]
+		match escaped {
+			`a` {
+				decoded << u8(7)
+			}
+			`b` {
+				decoded << u8(8)
+			}
+			`t` {
+				decoded << `\t`
+			}
+			`n` {
+				decoded << `\n`
+			}
+			`v` {
+				decoded << u8(11)
+			}
+			`f` {
+				decoded << u8(12)
+			}
+			`r` {
+				decoded << `\r`
+			}
+			`"`, `\\` {
+				decoded << escaped
+			}
+			else {
+				if escaped >= `0` && escaped <= `7` {
+					mut octal := int(escaped - `0`)
+					mut digits := 1
+					for digits < 3 && i + 1 < value.len && value[i + 1] >= `0`
+						&& value[i + 1] <= `7` {
+						i++
+						digits++
+						octal = octal * 8 + int(value[i] - `0`)
+					}
+					decoded << u8(octal)
+				} else {
+					decoded << escaped
+				}
+			}
+		}
+		i++
+	}
+	return decoded.bytestr(), i
 }
 
 fn (d &DiffLine) compact_sign() string {

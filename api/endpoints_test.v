@@ -12,6 +12,10 @@
 //   GET  /api/v1/repos/:username/:repo_name/issues
 //   POST /api/v1/repos/:username/:repo_name/issues
 //   GET  /api/v1/repos/:username/:repo_name/issues/:id
+//   GET  /api/v1/repos/:username/:repo_name/issues/:id/comments
+//   POST /api/v1/repos/:username/:repo_name/issues/:id/comments
+//   POST /api/v1/repos/:username/:repo_name/issues/:id/close
+//   POST /api/v1/repos/:username/:repo_name/issues/:id/reopen
 //   GET  /api/v1/repos/:username/:repo_name/pulls
 //   GET  /api/v1/repos/:username/:repo_name/pulls/:id
 //   GET  /api/v1/repos/:username/:repo_name/pulls/:id/comments
@@ -266,13 +270,18 @@ fn add_organization_member(token string, org_name string, username string) ! {
 }
 
 fn create_api_token(token string, username string) !string {
+	return create_api_token_with_form(token, username,
+		'name=api-test&scope_api=on&expires_in_days=30')
+}
+
+fn create_api_token_with_form(token string, username string, form string) !string {
 	resp := http.fetch(
 		method:         .post
 		url:            url('/${username}/settings/api-tokens')
 		cookies:        {
 			'token': token
 		}
-		data:           'name=api-test'
+		data:           form
 		allow_redirect: false
 	)!
 	if resp.status_code != 302 && resp.status_code != 303 {
@@ -317,13 +326,14 @@ pub struct ApiUserSummary {
 }
 
 pub struct ApiIssueSummary {
-	id      int
-	number  int
-	repo_id int
-	title   string
-	body    string
-	author  string
-	status  string
+	id        int
+	number    int
+	repo_id   int
+	title     string
+	body      string
+	author    string
+	status    string
+	assignees []string
 }
 
 pub struct ApiPullSummary {
@@ -360,6 +370,11 @@ pub struct ApiBoolResult {
 	result  bool
 }
 
+pub struct ApiStatusSummary {
+	success bool
+	message string
+}
+
 pub struct ApiFilesResult {
 	success bool
 	result  []FileSummary
@@ -382,6 +397,11 @@ fn bearer_header() http.Header {
 fn test_api_v1_me_requires_auth() {
 	resp := http.get(url('/api/v1/me')) or { panic(err) }
 	assert resp.status_code == 401
+	error_response := json.decode[ApiStatusSummary](resp.body) or { panic(err) }
+	assert !error_response.success
+	assert error_response.message == 'authentication required'
+	assert resp.body.contains('"success":false')
+	assert !resp.body.contains('"success":"false"')
 }
 
 fn test_api_v1_me_with_bearer() {
@@ -393,6 +413,25 @@ fn test_api_v1_me_with_bearer() {
 	assert resp.status_code == 200
 	user := json.decode[ApiUserSummary](resp.body) or { panic(err) }
 	assert user.username == test_username
+}
+
+fn test_api_v1_read_only_token_cannot_mutate() {
+	read_token := create_api_token_with_form(session_cookie(), test_username,
+		'name=read-only&scope_read_api=on&expires_in_days=7') or { panic(err) }
+	read_header := http.new_header(key: .authorization, value: 'Bearer ${read_token}')
+	me := http.fetch(
+		method: .get
+		url:    url('/api/v1/me')
+		header: read_header
+	) or { panic(err) }
+	assert me.status_code == 200
+
+	star := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/${repo_id()}/star')
+		header: read_header
+	) or { panic(err) }
+	assert star.status_code == 401
 }
 
 fn test_api_v1_me_with_session_cookie() {
@@ -424,13 +463,27 @@ fn test_api_v1_user_repos() {
 	repos := json.decode[[]ApiRepoSummary](resp.body) or { panic(err) }
 	assert repos.len >= 1
 	mut found := false
+	mut leaked_private := false
 	for r in repos {
 		if r.name == test_repo {
 			found = true
-			break
+		}
+		if r.name == test_private_repo {
+			leaked_private = true
 		}
 	}
 	assert found
+	assert !leaked_private
+
+	token := os.getenv(env_bearer)
+	owner_resp := http.fetch(
+		method: .get
+		url:    url('/api/v1/users/${test_username}/repos')
+		header: http.new_header(key: .authorization, value: 'Bearer ${token}')
+	) or { panic(err) }
+	assert owner_resp.status_code == 200
+	owner_repos := json.decode[[]ApiRepoSummary](owner_resp.body) or { panic(err) }
+	assert owner_repos.any(it.name == test_private_repo)
 }
 
 fn test_api_v1_repo_show() {
@@ -470,6 +523,10 @@ fn test_api_v1_create_issue_requires_title() {
 		data:   'body=missing-title'
 	) or { panic(err) }
 	assert resp.status_code == 400
+	error_response := json.decode[ApiStatusSummary](resp.body) or { panic(err) }
+	assert !error_response.success
+	assert error_response.message.contains('title is required')
+	assert resp.body.contains('"success":false')
 }
 
 fn test_api_v1_create_issue_succeeds() {
@@ -504,6 +561,46 @@ fn test_api_v1_repo_issue_not_found() {
 		panic(err)
 	}
 	assert resp.status_code == 404
+}
+
+fn test_api_v1_issue_comments_and_lifecycle() {
+	listing := http.get(url('/api/v1/repos/${test_username}/${test_repo}/issues')) or { panic(err) }
+	issues := json.decode[[]ApiIssueSummary](listing.body) or { panic(err) }
+	issue := issues.filter(it.title == 'first-issue').first()
+
+	created := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/${test_username}/${test_repo}/issues/${issue.id}/comments')
+		header: http.new_header_from_map({
+			.authorization: 'Bearer ${bearer_token()}'
+			.content_type:  'application/x-www-form-urlencoded'
+		})
+		data:   'text=API+comment'
+	) or { panic(err) }
+	assert created.status_code == 200
+
+	comments_resp := http.get(url('/api/v1/repos/${test_username}/${test_repo}/issues/${issue.id}/comments')) or {
+		panic(err)
+	}
+	comments := json.decode[[]ApiCommentSummary](comments_resp.body) or { panic(err) }
+	assert comments.any(it.author == test_username && it.text == 'API comment')
+
+	closed_resp := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/${test_username}/${test_repo}/issues/${issue.id}/close')
+		header: bearer_header()
+	) or { panic(err) }
+	assert closed_resp.status_code == 200
+	closed := json.decode[ApiIssueSummary](closed_resp.body) or { panic(err) }
+	assert closed.status == 'closed'
+
+	reopened_resp := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/${test_username}/${test_repo}/issues/${issue.id}/reopen')
+		header: bearer_header()
+	) or { panic(err) }
+	reopened := json.decode[ApiIssueSummary](reopened_resp.body) or { panic(err) }
+	assert reopened.status == 'open'
 }
 
 fn test_api_v1_repo_pulls_empty() {
@@ -568,6 +665,16 @@ fn test_api_v1_commits_count() {
 	assert decoded.result == 0
 }
 
+fn test_api_v1_count_endpoints_hide_unknown_and_private_repos() {
+	unknown := http.get(url('/api/v1/ghost_user/ghost_repo/branches/count')) or { panic(err) }
+	assert unknown.status_code == 404
+
+	private := http.get(url('/api/v1/${test_username}/${test_private_repo}/issues/count')) or {
+		panic(err)
+	}
+	assert private.status_code == 404
+}
+
 fn test_api_v1_repo_star_toggle() {
 	rid := repo_id()
 	resp := http.fetch(
@@ -587,6 +694,13 @@ fn test_api_v1_repo_star_toggle() {
 	) or { panic(err) }
 	second := json.decode[ApiBoolResult](resp2.body) or { panic(err) }
 	assert second.result == false
+
+	missing := http.fetch(
+		method: .post
+		url:    url('/api/v1/repos/9999999/star')
+		header: bearer_header()
+	) or { panic(err) }
+	assert missing.status_code == 404
 }
 
 fn test_api_v1_repo_watch_toggle() {
@@ -604,6 +718,7 @@ fn test_api_v1_repo_watch_toggle() {
 fn test_api_v1_repo_tree_files_requires_branch() {
 	rid := repo_id()
 	resp := http.get(url('/api/v1/repos/${rid}/tree/files')) or { panic(err) }
+	assert resp.status_code == 400
 	assert resp.body.contains('branch is required')
 }
 
@@ -617,7 +732,9 @@ fn test_api_v1_repo_tree_files_with_branch() {
 
 fn test_api_v1_repo_tree_files_unknown_repo() {
 	resp := http.get(url('/api/v1/repos/9999999/tree/files?branch=main')) or { panic(err) }
-	assert resp.body.contains('Not found')
+	assert resp.status_code == 404
+	error_response := json.decode[ApiStatusSummary](resp.body) or { panic(err) }
+	assert !error_response.success
 }
 
 fn test_api_v1_users_avatar_requires_auth() {
@@ -761,6 +878,6 @@ fn test_api_v1_protected_branches() {
 	) or { panic(err) }
 	assert listing.status_code == 200
 	rules := json.decode[[]ApiProtectedBranchSummary](listing.body) or { panic(err) }
-	assert rules.any(it.pattern == 'master')
+	assert rules.any(it.pattern == 'main')
 	assert rules.any(it.pattern == 'release/*')
 }

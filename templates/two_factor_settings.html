@@ -11,7 +11,11 @@
 
 			@if enabled
 				<p class="twofa-status twofa-status--on">%twofa_status_enabled</p>
-				<form method='post' action='/@username/settings/2fa/disable'>
+				<p>Enter a current authenticator code to disable two-factor authentication.</p>
+				<form method='post' action='/@username/settings/2fa/disable' class="form">
+					<div class="field">
+						<input type='text' name='code' placeholder='%twofa_code' pattern='[0-9]*' inputmode='numeric' autocomplete='one-time-code' required>
+					</div>
 					<button type='submit' class='pr-action pr-action--close'>%twofa_disable</button>
 				</form>
 			@else

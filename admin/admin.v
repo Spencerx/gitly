@@ -1,21 +1,53 @@
 module main
 
 pub fn (mut app App) edit_user(user_id int, delete_tokens bool, is_blocked bool, is_admin bool) ! {
-	if is_admin {
-		app.add_admin(user_id)!
-	} else {
-		app.remove_admin(user_id)!
+	if user_id <= 0 {
+		return error('Invalid user')
+	}
+	mut tx := db_begin_transaction(mut app.db)!
+	mut committed := false
+	defer {
+		if !committed {
+			tx.rollback() or {}
+		}
 	}
 
-	if is_blocked {
-		app.block_user(user_id)!
-	} else {
-		app.unblock_user(user_id)!
+	// Serialize edits which could deactivate an administrator. The previous
+	// count-then-update sequence let two admins concurrently demote/block each
+	// other after both observed a count of two, leaving the site with no active
+	// administrator. PostgreSQL locks the matching rows; SQLite serializes the
+	// eventual writer and rejects the competing transaction.
+	mut active_admin_query := 'select ${sql_table('id')} from ${sql_table('User')}
+		where ${sql_table('is_admin')} is true
+		and ${sql_table('is_registered')} is true
+		and ${sql_table('is_blocked')} is false'
+	$if sqlite ? {
+	} $else {
+		active_admin_query += ' for update'
+	}
+	active_admin_rows := tx.execute(active_admin_query)!
+	mut target_is_active_admin := false
+	for row in active_admin_rows {
+		if row.vals.len > 0 && row.vals[0].int() == user_id {
+			target_is_active_admin = true
+			break
+		}
+	}
+	if target_is_active_admin && (!is_admin || is_blocked) && active_admin_rows.len <= 1 {
+		return error('The site must keep at least one active administrator')
 	}
 
+	id := user_id
+	sql tx {
+		update User set is_admin = is_admin, is_blocked = is_blocked where id == id
+	}!
 	if delete_tokens {
-		app.delete_tokens(user_id)!
+		sql tx {
+			delete from Token where user_id == id
+		}!
 	}
+	tx.commit()!
+	committed = true
 }
 
 pub fn (mut app App) block_user(user_id int) ! {

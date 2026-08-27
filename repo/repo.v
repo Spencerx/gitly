@@ -89,12 +89,14 @@ enum CloneReuseResult {
 enum ArchiveFormat {
 	zip
 	tar
+	tar_gz
 }
 
 fn (f ArchiveFormat) str() string {
 	return match f {
 		.zip { 'zip' }
 		.tar { 'tar' }
+		.tar_gz { 'tar.gz' }
 	}
 }
 
@@ -104,6 +106,7 @@ fn (mut app App) save_repo(repo Repo) ! {
 	views_count := repo.views_count
 	webhook_secret := repo.webhook_secret
 	tags_count := repo.tags_count
+	nr_tags := repo.nr_tags
 	is_public := repo.is_public // if repo.is_public { 1 } else { 0 } // SQLITE hack
 	open_issues_count := repo.nr_open_issues
 	open_prs_count := repo.nr_open_prs
@@ -119,7 +122,7 @@ fn (mut app App) save_repo(repo Repo) ! {
 		update Repo set description = desc, views_count = views_count, is_public = is_public,
 		webhook_secret = webhook_secret, tags_count = tags_count, nr_open_issues = open_issues_count,
 		nr_open_prs = open_prs_count, nr_releases = releases_count, nr_contributors = contributors_count,
-		nr_stars = stars_count, nr_branches = branches_count where id == id
+		nr_stars = stars_count, nr_branches = branches_count, nr_tags = nr_tags where id == id
 	}!
 }
 
@@ -354,6 +357,17 @@ fn (mut app App) update_repo_features(repo_id int, disable_discussions bool, dis
 	}!
 }
 
+fn (mut app App) update_repo_general_settings(repo_id int, description string, is_public bool, primary_branch string) ! {
+	if repo_id <= 0 || description.len > max_repo_description_len || !is_safe_ref(primary_branch) {
+		return error('invalid repository settings')
+	}
+	sql app.db {
+		update Repo set description = description, is_public = is_public, primary_branch = primary_branch
+		where id == repo_id
+	}!
+	app.ensure_default_branch_protection(repo_id, primary_branch)!
+}
+
 fn (mut app App) set_repo_required_approvals(repo_id int, required int) ! {
 	if repo_id <= 0 || required < 0 || required > 100 {
 		return error('required approvals must be between 0 and 100')
@@ -467,41 +481,72 @@ fn (r &Repo) last_activity_at() int {
 }
 
 fn (mut app App) delete_repository(id int, path string, name string) ! {
-	app.delete_repo_transfer_for_repo(id)!
-	app.delete_repo_fork_relationships(id)!
-	app.delete_repo_mirrors(id)!
-	app.delete_repo_project_members(id)!
-	app.delete_repo_protected_branches(id)!
-	app.delete_repo_deploy_keys(id)!
-	sql app.db {
-		update Repo set is_deleted = true where id == id
+	if id <= 0 {
+		return error('invalid repository')
+	}
+	repo_id := id
+	mut tx := db_begin_transaction(mut app.db)!
+	mut committed := false
+	defer {
+		if !committed {
+			tx.rollback() or {}
+		}
+	}
+	// Lock and revalidate the active repository before deleting related state.
+	// Without one transaction, a failure halfway through left a still-visible
+	// repository with transfers, mirrors, permissions, or branch rules missing.
+	locked := tx.execute('update ${sql_table('Repo')} set ${sql_table('id')} = ${sql_table('id')}
+		where ${sql_table('id')} = ${repo_id}
+		and ${sql_table('is_deleted')} is false
+		returning ${sql_table('id')}')!
+	if locked.len != 1 {
+		return error('repository is no longer available')
+	}
+	locked_repos := sql tx {
+		select from Repo where id == repo_id && is_deleted == false limit 1
 	}!
-	app.info('Marked repo as deleted (${id}, ${name})')
+	if locked_repos.len != 1 || locked_repos[0].git_dir != path || locked_repos[0].name != name {
+		// The repository may have been transferred after the route loaded it.
+		// Never tombstone that new owner's row and then remove the stale path.
+		return error('repository changed while deletion was requested')
+	}
+	locked_repo := locked_repos[0]
+	sql tx {
+		delete from RepoTransfer where repo_id == repo_id
+	}!
+	sql tx {
+		delete from RepoFork where repo_id == repo_id || source_repo_id == repo_id
+	}!
+	sql tx {
+		delete from RepoMirror where repo_id == repo_id
+	}!
+	sql tx {
+		delete from ProjectMember where repo_id == repo_id
+	}!
+	sql tx {
+		delete from ProtectedBranch where repo_id == repo_id
+	}!
+	sql tx {
+		delete from DeployKey where repo_id == repo_id
+	}!
+	sql tx {
+		update Repo set is_deleted = true where id == repo_id
+	}!
+	tombstoned := sql tx {
+		select count from Repo where id == repo_id && is_deleted == true
+	}!
+	if tombstoned != 1 {
+		return error('repository could not be tombstoned')
+	}
+	tx.commit()!
+	committed = true
+	app.info('Marked repo as deleted (${repo_id}, ${locked_repo.name})')
 
-	app.delete_repo_folder(path)
-	app.info('Removed repo folder (${id}, ${name})')
-}
-
-fn (mut app App) move_repo_to_user(repo Repo, dest_user User) ! {
-	dest_dir := os.join_path(app.config.repo_storage_path, dest_user.username)
-	if !os.exists(dest_dir) {
-		os.mkdir(dest_dir)!
-	}
-	dest_path := os.join_path(dest_dir, repo.name)
-	if os.exists(dest_path) {
-		return error('destination repository directory already exists')
-	}
-	os.mv(repo.git_dir, dest_path)!
-	id := repo.id
-	user_id := dest_user.id
-	user_name := dest_user.username
-	git_dir := dest_path
-	sql app.db {
-		update Repo set user_id = user_id, user_name = user_name, git_dir = git_dir where id == id
-	} or {
-		os.mv(dest_path, repo.git_dir) or {}
-		return err
-	}
+	// Authorized-keys generation and filesystem removal are side effects, so run
+	// them only after the database cleanup is durably committed.
+	app.sync_authorized_keys() or { app.warn('Could not update authorized_keys: ${err}') }
+	app.delete_repo_folder(locked_repo.git_dir)
+	app.info('Removed repo folder (${repo_id}, ${locked_repo.name})')
 }
 
 fn (mut app App) user_has_repo(user_id int, repo_name string) bool {
@@ -517,8 +562,11 @@ fn (mut app App) user_has_repo(user_id int, repo_name string) bool {
 fn (mut app App) update_repo_from_fs(mut repo Repo, recompute_lang_stats bool) ! {
 	println('UPDATE REPO FROM FS')
 	repo_id := repo.id
-
-	app.db.exec('BEGIN TRANSACTION')!
+	// This refresh rebuilds derived cache tables through helpers that currently
+	// accept App rather than orm.Tx. Never bracket those pooled DB calls with raw
+	// BEGIN/COMMIT: PostgreSQL may serve each call on a different connection and
+	// leave the BEGIN connection checked in with an open transaction. Each step
+	// is therefore deliberately idempotent and auto-committed for now.
 
 	// Language analysis reads every file in the repo and is slow on large
 	// repos; callers on the git push hot path pass `false` and run it in a
@@ -529,6 +577,7 @@ fn (mut app App) update_repo_from_fs(mut repo Repo, recompute_lang_stats bool) !
 
 	app.info(repo.nr_contributors.str())
 	app.fetch_branches(repo)!
+	app.fetch_tags(repo)!
 
 	branches_output := repo.git('branch -a')
 	println('b output=${branches_output}')
@@ -543,63 +592,20 @@ fn (mut app App) update_repo_from_fs(mut repo Repo, recompute_lang_stats bool) !
 	repo.nr_branches = app.get_count_repo_branches(repo_id)
 	repo.nr_open_prs = app.get_repo_open_pr_count(repo_id)
 
-	// TODO: TEMPORARY - UNTIL WE GET PERSISTENT RELEASE INFO
 	for tag in app.get_all_repo_tags(repo_id) {
 		app.add_release(tag.id, repo_id, time.unix(tag.created_at), tag.message)!
-
-		repo.nr_releases++
 	}
+	repo.nr_releases = app.get_repo_release_count(repo_id)
+	repo.nr_tags = app.get_all_repo_tags(repo_id).len
+	repo.tags_count = repo.nr_tags
 
 	app.save_repo(repo)!
-	app.db.exec('END TRANSACTION')!
 	app.info('Repo updated')
 }
 
 // fn (mut app App) update_repo_branch_from_fs(mut ctx Context, mut repo Repo, branch_name string) ! {
 fn (mut app App) update_repo_branch_from_fs(mut repo Repo, branch_name string) ! {
-	repo_id := repo.id
-	branch := app.find_repo_branch_by_name(repo.id, branch_name)
-
-	if branch.id == 0 {
-		return
-	}
-
-	data :=
-		repo.git('--no-pager log ${branch_name} --abbrev-commit --abbrev=7 --pretty="%h${log_field_separator}%aE${log_field_separator}%cD${log_field_separator}%s${log_field_separator}%aN"')
-
-	for line in data.split_into_lines() {
-		args := line.split(log_field_separator)
-
-		if args.len > 4 {
-			commit_hash := args[0]
-			commit_author_email := args[1]
-			commit_message := args[3]
-			commit_author := args[4]
-			mut commit_author_id := 0
-
-			// git log outputs newest commits first; if this commit already
-			// exists, all subsequent (older) commits do too — stop early.
-			if app.commit_exists(repo_id, branch.id, commit_hash) {
-				break
-			}
-
-			commit_date := time.parse_rfc2822(args[2]) or {
-				app.info('Error: ${err}')
-				return
-			}
-
-			user := app.get_user_by_email(commit_author_email) or { User{} }
-
-			if user.id > 0 {
-				app.add_contributor(user.id, repo_id)!
-
-				commit_author_id = user.id
-			}
-
-			app.add_commit(repo_id, branch.id, commit_hash, commit_author, commit_author_id,
-				commit_message, int(commit_date.unix()))!
-		}
-	}
+	app.update_repo_branch_data(mut repo, branch_name)!
 }
 
 fn (mut app App) update_repo_from_remote(mut repo Repo) ! {
@@ -607,8 +613,6 @@ fn (mut app App) update_repo_from_remote(mut repo Repo) ! {
 
 	repo.git('fetch --all')
 	repo.git('pull --all')
-
-	app.db.exec('BEGIN TRANSACTION')!
 
 	repo.analyze_lang(app)!
 
@@ -626,15 +630,16 @@ fn (mut app App) update_repo_from_remote(mut repo Repo) ! {
 
 	for tag in app.get_all_repo_tags(repo_id) {
 		app.add_release(tag.id, repo_id, time.unix(tag.created_at), tag.message)!
-		repo.nr_releases++
 	}
+	repo.nr_releases = app.get_repo_release_count(repo_id)
+	repo.nr_tags = app.get_all_repo_tags(repo_id).len
+	repo.tags_count = repo.nr_tags
 
 	repo.nr_contributors = app.get_count_repo_contributors(repo_id)!
 	repo.nr_branches = app.get_count_repo_branches(repo_id)
 	repo.nr_open_prs = app.get_repo_open_pr_count(repo_id)
 
 	app.save_repo(repo)!
-	app.db.exec('END TRANSACTION')!
 	app.info('Repo updated')
 }
 
@@ -646,8 +651,26 @@ fn (mut app App) update_repo_branch_data(mut repo Repo, branch_name string) ! {
 		return
 	}
 
-	data :=
-		repo.git('--no-pager log ${branch_name} --abbrev-commit --abbrev=7 --pretty="%h${log_field_separator}%aE${log_field_separator}%cD${log_field_separator}%s${log_field_separator}%aN"')
+	// Resolve reachability independently from metadata parsing. Only prune after
+	// Git has successfully produced the complete current history.
+	reachable_result := git.Git.exec_in_dir(repo.git_dir, ['rev-list', branch_name])
+	if reachable_result.exit_code != 0 {
+		return error('could not list branch commits: ${reachable_result.output}')
+	}
+	mut reachable := map[string]bool{}
+	for raw_hash in reachable_result.output.split_into_lines() {
+		commit_hash := raw_hash.trim_space()
+		if commit_hash != '' {
+			reachable[commit_hash] = true
+		}
+	}
+	log_format := '%H${log_field_separator}%aE${log_field_separator}%cD${log_field_separator}%s${log_field_separator}%aN'
+	log_result := git.Git.exec_in_dir(repo.git_dir, ['--no-pager', 'log', branch_name,
+		'--pretty=${log_format}'])
+	if log_result.exit_code != 0 {
+		return error('could not read branch history: ${log_result.output}')
+	}
+	data := log_result.output
 
 	for line in data.split_into_lines() {
 		args := line.split(log_field_separator)
@@ -659,8 +682,10 @@ fn (mut app App) update_repo_branch_data(mut repo Repo, branch_name string) ! {
 			commit_author := args[4]
 			mut commit_author_id := 0
 
+			// A merged history is not linear: an already-indexed first parent can
+			// appear before unseen commits from the merged side branch.
 			if app.commit_exists(repo_id, branch.id, commit_hash) {
-				break
+				continue
 			}
 
 			commit_date := time.parse_rfc2822(args[2]) or {
@@ -680,6 +705,7 @@ fn (mut app App) update_repo_branch_data(mut repo Repo, branch_name string) ! {
 				commit_message, int(commit_date.unix()))!
 		}
 	}
+	app.prune_branch_commit_links(repo_id, branch.id, reachable)!
 }
 
 fn (mut app App) update_repo_branch_after_change(repo_id int, branch_name string) ! {
@@ -689,21 +715,12 @@ fn (mut app App) update_repo_branch_after_change(repo_id int, branch_name string
 
 	mut repo := app.find_repo_by_id(repo_id) or { return }
 
-	app.db.exec('BEGIN TRANSACTION')!
-	mut committed := false
-	defer {
-		if !committed {
-			app.db.exec('ROLLBACK') or {}
-		}
-	}
 	app.fetch_branch(repo, branch_name)!
 	app.update_repo_branch_data(mut repo, branch_name)!
 	repo.nr_contributors = app.get_count_repo_contributors(repo_id)!
 	repo.nr_branches = app.get_count_repo_branches(repo_id)
 	repo.nr_open_prs = app.get_repo_open_pr_count(repo_id)
 	app.save_repo(repo)!
-	app.db.exec('END TRANSACTION')!
-	committed = true
 }
 
 // TODO: tags and other stuff
@@ -716,6 +733,7 @@ fn (mut app App) update_repo_after_push(repo_id int, branch_name string) ! {
 	app.update_repo_from_fs(mut repo, false)!
 	app.delete_repository_files_in_branch(repo_id, branch_name)!
 	app.clear_open_pr_approvals_for_head(repo_id, branch_name)!
+	app.refresh_open_cross_fork_pr_heads(repo_id, branch_name)
 }
 
 fn (mut app App) update_repo_after_ref_changes(repo_id int, updates []git.GitRefUpdate) ! {
@@ -730,6 +748,7 @@ fn (mut app App) update_repo_after_ref_changes(repo_id int, updates []git.GitRef
 		seen[branch] = true
 		app.delete_repository_files_in_branch(repo_id, branch)!
 		app.clear_open_pr_approvals_for_head(repo_id, branch)!
+		app.refresh_open_cross_fork_pr_heads(repo_id, branch)
 		if update.is_delete() {
 			app.delete_repo_branch_by_name(repo_id, branch)!
 		}
@@ -910,24 +929,22 @@ fn (r &Repo) git(command string) string {
 }
 
 fn (r &Repo) parse_ls(ls_line string, branch string) ?File {
-	ls_line_parts := ls_line.fields()
-	if ls_line_parts.len < 4 {
+	tab_pos := ls_line.index('\t') or { return none }
+	metadata := ls_line[..tab_pos].fields()
+	if metadata.len < 4 {
 		return none
 	}
 
-	item_type := ls_line_parts[1]
-	item_size := ls_line_parts[3]
-	item_path := ls_line_parts[4]
+	item_type := metadata[1]
+	item_size := metadata[3]
+	item_path := ls_line[tab_pos + 1..]
 
-	item_name := item_path.after('/')
+	item_name := os.base(item_path)
 	if item_name == '' {
 		return none
 	}
 
-	mut parent_path := os.dir(item_path)
-	if parent_path == item_name {
-		parent_path = ''
-	}
+	parent_path := os.dir(item_path)
 
 	if item_name.contains('"\\') {
 		// Unqoute octal UTF-8 strings
@@ -968,7 +985,7 @@ fn (r &Repo) parse_top_file_line(line string, branch string) ?File {
 		}
 	}
 
-	item_name := item_path.after('/')
+	item_name := os.base(item_path)
 	if item_name == '' {
 		return none
 	}
@@ -1001,7 +1018,7 @@ fn (r &Repo) lookup_file_via_git(branch string, path string) ?File {
 		if meta_parts.len < 4 || meta_parts[1] != 'blob' {
 			continue
 		}
-		item_name := item_path.after('/')
+		item_name := os.base(item_path)
 		if item_name == '' {
 			continue
 		}
@@ -1048,27 +1065,31 @@ fn (mut app App) cache_repository_items(mut r Repo, branch string, path string) 
 		return []
 	}
 
-	mut repository_ls := ''
 	if path == '.' {
 		r.status = .caching
 
 		defer {
 			r.status = .done
 		}
-	} else {
-		directory_path := if path == '' { path } else { '${path}/' }
-		format := '%(objectmode) %(objecttype) %(objectname) %(objectsize) %(path)'
-		repository_ls =
-			r.git('ls-tree --full-name --format="${format}" ${branch} ${directory_path}')
 	}
+	normalized_path := normalize_tree_path(path)
+	mut tree_args := ['ls-tree', '--full-name',
+		'--format=%(objectmode) %(objecttype) %(objectname) %(objectsize)%x09%(path)', branch]
+	if normalized_path != '' {
+		tree_args << '--'
+		tree_args << '${normalized_path}/'
+	}
+	tree_result := git.Git.exec_in_dir(r.git_dir, tree_args)
+	if tree_result.exit_code != 0 {
+		return error('could not list repository tree: ${tree_result.output}')
+	}
+	repository_ls := tree_result.output
 
 	// mode type name path
 	item_info_lines := repository_ls.split('\n')
 
 	mut dirs := []File{} // dirs first
 	mut files := []File{}
-
-	app.db.exec('BEGIN TRANSACTION')!
 
 	for item_info in item_info_lines {
 		is_item_info_empty := validation.is_string_empty(item_info)
@@ -1084,19 +1105,26 @@ fn (mut app App) cache_repository_items(mut r Repo, branch string, path string) 
 
 		if file.is_dir {
 			dirs << file
-
-			app.add_file(file)!
 		} else {
 			files << file
 		}
 	}
 
 	dirs << files
-	for file in files {
-		app.add_file(file)!
+	mut tx := db_begin_transaction(mut app.db)!
+	mut committed := false
+	defer {
+		if !committed {
+			tx.rollback() or {}
+		}
 	}
-
-	app.db.exec('END TRANSACTION')!
+	for file in dirs {
+		sql tx {
+			insert file into File
+		}!
+	}
+	tx.commit()!
+	committed = true
 
 	return dirs
 }
@@ -1190,14 +1218,14 @@ fn normalize_tree_path(path string) string {
 
 fn (r Repo) get_last_branch_commit_hash(branch_name string) string {
 	git_result := git.Git.exec_in_dir(r.git_dir,
-		['log', '-n', '1', branch_name, '--pretty=format:%h'])
+		['log', '-n', '1', branch_name, '--pretty=format:%H'])
 	git_output := git_result.output
 
 	if git_result.exit_code != 0 {
 		eprintln('git log error: ${git_output}')
 	}
 
-	return git_output
+	return git_output.trim_space()
 }
 
 fn (r Repo) git_advertise(service string) string {
@@ -1211,14 +1239,14 @@ fn (r Repo) git_advertise(service string) string {
 	return git_output
 }
 
-fn (r Repo) archive_tag(tag string, path string, format ArchiveFormat) {
+fn (r Repo) archive_tag(tag string, path string, format ArchiveFormat) ! {
 	if !is_safe_ref(tag) {
-		return
+		return error('invalid tag name')
 	}
-	result := git.Git.exec_in_dir(r.git_dir, ['archive', tag, '--format=${format}',
+	result := git.Git.exec_in_dir(r.git_dir, ['archive', 'refs/tags/${tag}', '--format=${format}',
 		'--output=${path}'])
 	if result.exit_code != 0 {
-		eprintln('git archive error: ${result.output}')
+		return error('git archive failed: ${result.output}')
 	}
 }
 
@@ -1235,6 +1263,40 @@ fn (r Repo) get_commit_patch(commit_hash string) ?string {
 
 fn (r Repo) git_smart(service string, input string) string {
 	return r.git_smart_with_env(service, input, map[string]string{})
+}
+
+// drain_process_output consumes both output pipes while the child is running.
+// Git hooks can write enough data to stderr to fill its pipe; draining stdout
+// first in that situation deadlocks because Git cannot exit and close stdout.
+fn drain_process_output(mut process os.Process) (string, string) {
+	mut output := ''
+	mut errors := ''
+	for process.is_alive() {
+		mut drained := false
+		for process.is_pending(.stdout) {
+			chunk := process.stdout_read()
+			if chunk.len == 0 {
+				break
+			}
+			output += chunk
+			drained = true
+		}
+		for process.is_pending(.stderr) {
+			chunk := process.stderr_read()
+			if chunk.len == 0 {
+				break
+			}
+			errors += chunk
+			drained = true
+		}
+		if !drained {
+			time.sleep(time.millisecond)
+		}
+	}
+	// Capture bytes written between the final liveness check and process exit.
+	output += process.stdout_slurp()
+	errors += process.stderr_slurp()
+	return output, errors
 }
 
 fn (r Repo) git_smart_with_env(service string, input string, extra_env map[string]string) string {
@@ -1256,16 +1318,19 @@ fn (r Repo) git_smart_with_env(service string, input string, extra_env map[strin
 	process.stdin_write(input)
 	process.stdin_write('\n')
 
-	output := process.stdout_slurp()
-	errors := process.stderr_slurp()
-
+	output, errors := drain_process_output(mut process)
 	process.wait()
+	exit_code := process.code
 	process.close()
 
-	if errors.len > 0 {
-		eprintln('git ${service} error: ${errors}')
-
+	if exit_code != 0 {
+		diagnostic := if errors.len > 4096 { errors[..4096] + '\n[truncated]' } else { errors }
+		eprintln('git ${service} failed (${exit_code}): ${diagnostic}')
 		return ''
+	}
+	if errors.len > 0 {
+		diagnostic := if errors.len > 4096 { errors[..4096] + '\n[truncated]' } else { errors }
+		eprintln('git ${service} warning: ${diagnostic}')
 	}
 
 	return output
@@ -1304,7 +1369,12 @@ fn first_line(s string) string {
 }
 
 fn (mut app App) fetch_file_info(r &Repo, file &File) ! {
-	logs := r.git('log -n1 --format=%B___%at___%H___%an ${file.branch} -- ${file.full_path()}')
+	result := git.Git.exec_in_dir(r.git_dir, ['log', '-n1', '--format=%B___%at___%H___%an', file.branch,
+		'--', file.full_path()])
+	if result.exit_code != 0 {
+		return error('could not fetch file history: ${result.output}')
+	}
+	logs := result.output.trim_space()
 	vals := logs.split('___')
 	if vals.len < 3 {
 		return
@@ -1444,11 +1514,19 @@ fn (mut r Repo) clone_from_existing(source Repo, enforce_size_limit bool) CloneR
 		'Reusing existing local clone from ${source.user_name}/${source.name}')
 	tmp_path := '${r.git_dir}.tmp-${os.getpid()}-${time.ticks()}'
 	os.rmdir_all(tmp_path) or {}
-	os.cp_all(source.git_dir, tmp_path, false) or {
+	// Go through upload-pack instead of copying the bare directory byte-for-byte.
+	// A raw copy also carries repository-local config, remotes, hooks, hidden refs,
+	// and unreachable objects (for example refs used for merge request previews).
+	// Besides leaking state between projects that share an upstream URL, copying a
+	// live object directory can race a concurrent repack. `--no-local` asks Git to
+	// transfer only the advertised heads/tags and their reachable objects into a
+	// freshly initialized bare repository.
+	local_clone := git.Git.exec(['clone', '--bare', '--no-local', source.git_dir, tmp_path])
+	if !git_result_ok(local_clone) {
 		append_clone_progress(progress_path,
 			'Local clone reuse failed while copying; falling back to git clone.')
 		os.rmdir_all(tmp_path) or {}
-		eprintln('failed to copy reusable repo ${source.git_dir} to ${tmp_path}: ${err}')
+		eprintln('failed to clone reusable repo ${source.git_dir} to ${tmp_path}: ${local_clone.output}')
 		return .unavailable
 	}
 	os.mv(tmp_path, r.git_dir, overwrite: false) or {
@@ -1621,10 +1699,18 @@ fn (app &App) user_can_write_repo(user_id int, repo Repo) bool {
 }
 
 // can_admin_repo reports whether the currently logged-in user is allowed to
-// administer (settings/delete/move/webhooks/...) the given, already-loaded
-// target repo. It must be called with the repo loaded from the URL owner, not
-// re-queried by the logged-in user's name — otherwise a user could pass the
-// check for someone else's repo simply by owning a repo with the same name.
+// maintain the given, already-loaded target repo (settings, webhooks, branch
+// rules, and similar routine administration). It must be called with the repo
+// loaded from the URL owner, not re-queried by the logged-in user's name —
+// otherwise a user could pass the check for someone else's repo simply by
+// owning a repo with the same name.
 fn (app &App) can_admin_repo(ctx Context, repo Repo) bool {
 	return ctx.logged_in && app.repo_access_level(ctx.user.id, repo) >= project_access_maintainer
+}
+
+// can_own_repo is the narrower gate for operations that surrender or destroy
+// repository ownership. A Maintainer can administer a project, but only a
+// personal namespace owner or organization administrator has Owner access.
+fn (app &App) can_own_repo(ctx Context, repo Repo) bool {
+	return ctx.logged_in && app.repo_access_level(ctx.user.id, repo) >= project_access_owner
 }

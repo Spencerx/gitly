@@ -15,6 +15,17 @@ mut:
 }
 
 pub fn (mut app App) add_release(tag_id int, repo_id int, date time.Time, notes string) ! {
+	existing := sql app.db {
+		select from Release where tag_id == tag_id && repo_id == repo_id limit 1
+	} or { []Release{} }
+	if existing.len > 0 {
+		id := existing[0].id
+		sql app.db {
+			update Release set notes = notes, date = date where id == id
+		}!
+		return
+	}
+
 	release := Release{
 		tag_id:  tag_id
 		repo_id: repo_id
@@ -24,6 +35,12 @@ pub fn (mut app App) add_release(tag_id int, repo_id int, date time.Time, notes 
 
 	sql app.db {
 		insert release into Release
+	}!
+}
+
+fn (mut app App) delete_release_for_tag(repo_id int, tag_id int) ! {
+	sql app.db {
+		delete from Release where repo_id == repo_id && tag_id == tag_id
 	}!
 }
 

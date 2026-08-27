@@ -75,19 +75,12 @@ fn (app &App) repo_access_level(user_id int, repo Repo) int {
 	return level
 }
 
-fn (mut app App) add_project_member(repo_id int, user_id int, role string) ! {
+fn (mut app App) add_project_member(repo_id int, user_id int, role string) !int {
 	if repo_id <= 0 || user_id <= 0 || !valid_project_member_role(role) {
 		return error('invalid project member')
 	}
-	member := ProjectMember{
-		repo_id:    repo_id
-		user_id:    user_id
-		role:       role
-		created_at: int(time.now().unix())
-	}
-	sql app.db {
-		insert member into ProjectMember
-	}!
+	return db_insert_returning_id(mut app.db, 'ProjectMember', ['repo_id', 'user_id', 'role',
+		'created_at'], [repo_id.str(), user_id.str(), role, int(time.now().unix()).str()])
 }
 
 fn (app &App) find_project_members(repo_id int) []ProjectMemberView {

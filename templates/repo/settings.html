@@ -16,6 +16,33 @@
 			@end
 
 			<section class="settings-section">
+				<h2 class="settings-section__title">General</h2>
+				<p class="settings-section__desc">Update the project description, visibility, and default branch.</p>
+				<form class="settings-form general-settings-form" action="/@repo.user_name/@repo.name/settings" method="post">
+					<label for="repo-description">Description</label>
+					<textarea id="repo-description" name="description" maxlength="@max_repo_description_len" rows="3">@repo.description</textarea>
+					<label for="repo-visibility">Visibility</label>
+					<select id="repo-visibility" name="repo_visibility">
+						@if repo.is_public
+							<option value="public" selected>Public</option>
+							<option value="private">Private</option>
+						@else
+							<option value="public">Public</option>
+							<option value="private" selected>Private</option>
+						@end
+					</select>
+					<label for="repo-primary-branch">Default branch</label>
+					<input id="repo-primary-branch" type="text" name="primary_branch" value="@repo.primary_branch" list="repo-primary-branches" required>
+					<datalist id="repo-primary-branches">
+						@for branch in branches
+							<option value="@branch.name"></option>
+						@end
+					</datalist>
+					<button class="settings-form__submit" type="submit">Save changes</button>
+				</form>
+			</section>
+
+			<section class="settings-section">
 				<h2 class="settings-section__title">%features_section_title</h2>
 				<p class="settings-section__desc">%features_section_desc</p>
 				<form class="settings-form features-form" action="/@repo.user_name/@repo.name/settings/features" method="post">
@@ -69,6 +96,7 @@
 				<a class="settings-form__submit settings-form__submit--link" href="/@repo.user_name/@repo.name/settings/webhooks">%manage_webhooks</a>
 			</section>
 
+			@if can_own
 			<section class="settings-section settings-section--danger">
 				<h2 class="settings-section__title">%danger_zone</h2>
 
@@ -149,7 +177,8 @@
 						if (e.target === modal) modal.hidden = true;
 					});
 				})();
-			</script>
+				</script>
+			@end
 		</div>
 
 		@include '../layout/footer.html'

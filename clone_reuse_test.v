@@ -45,6 +45,16 @@ fn test_clone_from_existing_fetches_latest_origin_branch() {
 	must_git_clone_reuse(['-C', origin_dir, 'symbolic-ref', 'HEAD', 'refs/heads/main'])
 
 	must_git_clone_reuse(['clone', '--bare', origin_dir, source_dir])
+	// State created by Gitly in the reusable repository must not be copied into
+	// an unrelated project that happens to use the same upstream URL.
+	must_git_clone_reuse(['-C', work_dir, 'checkout', '-b', 'private-preview'])
+	os.write_file(os.join_path(work_dir, 'private.txt'), 'not advertised by origin\n')!
+	must_git_clone_reuse(['-C', work_dir, 'add', 'private.txt'])
+	must_git_clone_reuse(['-C', work_dir, 'commit', '-m', 'private preview'])
+	private_sha := must_git_clone_reuse(['-C', work_dir, 'rev-parse', 'HEAD'])
+	must_git_clone_reuse(['-C', work_dir, 'push', source_dir, 'HEAD:refs/gitly-comparisons/1/2'])
+	must_git_clone_reuse(['-C', source_dir, 'remote', 'add', 'copied-only', origin_dir])
+	must_git_clone_reuse(['-C', work_dir, 'checkout', 'main'])
 	os.write_file(os.join_path(work_dir, 'file.txt'), 'second\n')!
 	must_git_clone_reuse(['-C', work_dir, 'commit', '-am', 'second'])
 	must_git_clone_reuse(['-C', work_dir, 'push', 'origin', 'main'])
@@ -68,5 +78,9 @@ fn test_clone_from_existing_fetches_latest_origin_branch() {
 	assert target_repo.primary_branch == 'main'
 	assert repo_origin_url(target_dir) or { '' } == origin_dir
 	assert must_git_clone_reuse(['-C', target_dir, 'rev-parse', 'main']) == latest_sha
+	assert must_git_clone_reuse(['-C', target_dir, 'remote']) == 'origin'
+	assert git.Git.exec_in_dir(target_dir, ['show-ref', '--verify', '--quiet',
+		'refs/gitly-comparisons/1/2']).exit_code != 0
+	assert git.Git.exec_in_dir(target_dir, ['cat-file', '-e', private_sha]).exit_code != 0
 	assert !os.exists(target_repo.clone_progress_path())
 }

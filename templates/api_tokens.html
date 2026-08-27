@@ -20,6 +20,22 @@
 				<div class="field">
 					<input type='text' name='name' placeholder='%api_token_name' required>
 				</div>
+				<fieldset class='field'>
+					<legend>Scopes</legend>
+					<label><input type='checkbox' name='scope_api'> <code>api</code> — full API access</label><br>
+					<label><input type='checkbox' name='scope_read_api' checked> <code>read_api</code> — read-only API access</label><br>
+					<label><input type='checkbox' name='scope_read_repository' checked> <code>read_repository</code> — clone and fetch</label><br>
+					<label><input type='checkbox' name='scope_write_repository'> <code>write_repository</code> — clone, fetch, and push</label>
+				</fieldset>
+				<div class='field'>
+					<label for='api-token-expiry'>Expires in</label>
+					<select id='api-token-expiry' name='expires_in_days' required>
+						<option value='7'>7 days</option>
+						<option value='30' selected>30 days</option>
+						<option value='90'>90 days</option>
+						<option value='365'>365 days</option>
+					</select>
+				</div>
 				<div class="field">
 					<button type='submit' class='settings-form__submit'>%api_token_create</button>
 				</div>
@@ -32,6 +48,7 @@
 					@for t in tokens
 						<li class="api-token-row">
 							<strong>@t.name</strong>
+							<div><small>Scopes: <code>@t.scopes</code> · Expires: @{t.expiry_description()}</small></div>
 							<form method='post' action='/@username/settings/api-tokens/@t.id/delete' class="inline-form">
 								<button type='submit' class='link-button'>%api_token_revoke</button>
 							</form>

@@ -20,7 +20,21 @@ fn test_read_config_uses_database_defaults() {
 	assert conf.sqlite.path == 'gitly.sqlite'
 	assert conf.usdt_wallet == ''
 	assert conf.ci_secret == ''
+	assert conf.ci_callback_url == ''
 	assert !conf.cookie_secure
+}
+
+fn test_read_config_allows_ci_callback_url_override() {
+	path := os.join_path(os.temp_dir(), 'gitly_config_ci_callback_${os.getpid()}.json')
+	os.write_file(path,
+		'{"repo_storage_path":"./repos","archive_path":"./archives","avatars_path":"./avatars","hostname":"gitly.test","ci_service_url":"http://localhost:8081","ci_callback_url":"https://configured.test/api/v1/ci/status"}')!
+	defer {
+		os.rm(path) or {}
+		os.unsetenv('GITLY_CI_CALLBACK_URL')
+	}
+	os.setenv('GITLY_CI_CALLBACK_URL', 'https://runtime.test/hooks/ci', true)
+	conf := read_config(path)!
+	assert conf.ci_callback_url == 'https://runtime.test/hooks/ci'
 }
 
 fn test_read_config_allows_runtime_path_overrides() {

@@ -3,6 +3,7 @@ module main
 import veb
 import validation
 import api
+import time
 
 struct ItemWithUser[T] {
 	item T
@@ -15,11 +16,11 @@ type CommentWithUser = ItemWithUser[Comment]
 @['/api/v1/:username/:repo_name/issues/count']
 fn (mut app App) handle_issues_count(username string, repo_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 	caller := app.api_user_from_ctx(ctx) or { User{} }
 	if !app.user_has_repo_read_access(caller.id, repo) {
-		return ctx.json_error('Not found')
+		return ctx.api_not_found()
 	}
 	count := app.get_repo_issue_count(repo.id)
 	return ctx.json(api.ApiIssueCount{
@@ -49,7 +50,7 @@ pub fn (mut app App) handle_get_user_issues(mut ctx Context, username string) ve
 @['/:username/:repo_name/issues'; post]
 pub fn (mut app App) handle_add_repo_issue(mut ctx Context, username string, repo_name string) veb.Result {
 	// TODO: use captcha instead of user restrictions
-	if !ctx.logged_in || (ctx.logged_in && ctx.user.posts_count >= posts_per_day) {
+	if !ctx.logged_in || user_reached_post_limit(ctx.user, int(time.now().unix())) {
 		return ctx.redirect_to_index()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
@@ -98,10 +99,33 @@ pub fn (mut app App) issues(mut ctx Context, username string, repo_name string, 
 	if page_i < 0 {
 		page_i = 0
 	}
-	issue_count := app.get_repo_issue_count(repo.id)
-	if repo.nr_open_issues != issue_count {
+	open_issue_count := app.get_repo_issue_count(repo.id)
+	if repo.nr_open_issues != open_issue_count {
 		app.sync_repo_open_issue_count(repo.id) or { app.info(err.str()) }
-		repo.nr_open_issues = issue_count
+		repo.nr_open_issues = open_issue_count
+	}
+	current_state := normalize_issue_state(ctx.query['state'] or { 'open' })
+	closed_issue_count := app.get_repo_closed_issue_count(repo.id)
+	all_issue_count := open_issue_count + closed_issue_count
+	open_tab_class := if current_state == 'open' {
+		'issue-state-tab issue-state-tab--active'
+	} else {
+		'issue-state-tab'
+	}
+	closed_tab_class := if current_state == 'closed' {
+		'issue-state-tab issue-state-tab--active'
+	} else {
+		'issue-state-tab'
+	}
+	all_tab_class := if current_state == 'all' {
+		'issue-state-tab issue-state-tab--active'
+	} else {
+		'issue-state-tab'
+	}
+	issue_count := match current_state {
+		'all' { all_issue_count }
+		'closed' { closed_issue_count }
+		else { open_issue_count }
 	}
 	page_count := calculate_pages(issue_count, commits_per_page)
 	if page_i > page_count {
@@ -113,7 +137,7 @@ pub fn (mut app App) issues(mut ctx Context, username string, repo_name string, 
 	mut issues_with_users := []IssueWithUser{}
 	mut issue := Issue{}
 	mut user := User{}
-	repo_issues := app.find_repo_issues_as_page(repo.id, page_i)
+	repo_issues := app.find_repo_issues_as_page_by_state(repo.id, page_i, current_state)
 	mut i := 0
 	for i = 0; i < repo_issues.len; i++ {
 		issue = repo_issues[i]
@@ -140,11 +164,24 @@ pub fn (mut app App) issue(mut ctx Context, username string, repo_name string, i
 	if !app.can_read_repo(ctx, repo) {
 		return ctx.not_found()
 	}
-	issue := app.find_issue_by_id(id.int()) or { return ctx.not_found() }
+	mut issue := app.find_issue_by_id(id.int()) or { return ctx.not_found() }
 	if issue.repo_id != repo.id || issue.is_pr {
 		return ctx.not_found()
 	}
 	issue_author := app.get_user_by_id(issue.author_id) or { placeholder_user(issue.author_id) }
+	can_manage := ctx.logged_in
+		&& (issue.author_id == ctx.user.id || app.user_can_write_repo(ctx.user.id, repo))
+	can_manage_assignees := ctx.logged_in && app.user_can_write_repo(ctx.user.id, repo)
+	assignees := app.find_issue_assignees(issue)
+	issue.assigned = assignees.map(it.id)
+	mut assignable_users := []User{}
+	if can_manage_assignees {
+		for candidate in app.find_issue_assignable_users(repo) {
+			if candidate.id !in issue.assigned {
+				assignable_users << candidate
+			}
+		}
+	}
 	ctx.set_page_title(['${issue.title} #${issue.id}', '${repo.user_name}/${repo.name}'])
 	mut comments_with_users := []CommentWithUser{}
 	mut comment := Comment{}
@@ -162,6 +199,89 @@ pub fn (mut app App) issue(mut ctx Context, username string, repo_name string, i
 		}
 	}
 	return $veb.html()
+}
+
+@['/:username/:repo_name/issue/:id/assign'; post]
+pub fn (mut app App) handle_assign_issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	if !ctx.logged_in {
+		return ctx.redirect_to_login()
+	}
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.user_can_write_repo(ctx.user.id, repo) {
+		return ctx.not_found()
+	}
+	issue := app.find_issue_by_id(id.int()) or { return ctx.not_found() }
+	if issue.repo_id != repo.id || issue.is_pr {
+		return ctx.not_found()
+	}
+	app.assign_issue(issue.id, ctx.form['assignee_id'].int()) or {
+		ctx.error('Could not assign that project member')
+		return app.issue(mut ctx, username, repo_name, id)
+	}
+	return ctx.redirect('/${username}/${repo_name}/issue/${issue.id}')
+}
+
+@['/:username/:repo_name/issue/:id/unassign'; post]
+pub fn (mut app App) handle_unassign_issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	if !ctx.logged_in {
+		return ctx.redirect_to_login()
+	}
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.user_can_write_repo(ctx.user.id, repo) {
+		return ctx.not_found()
+	}
+	issue := app.find_issue_by_id(id.int()) or { return ctx.not_found() }
+	if issue.repo_id != repo.id || issue.is_pr {
+		return ctx.not_found()
+	}
+	app.unassign_issue(issue.id, ctx.form['assignee_id'].int()) or {
+		ctx.error('Could not remove that assignee')
+		return app.issue(mut ctx, username, repo_name, id)
+	}
+	return ctx.redirect('/${username}/${repo_name}/issue/${issue.id}')
+}
+
+@['/:username/:repo_name/issue/:id/close'; post]
+pub fn (mut app App) handle_close_issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	return change_issue_status(mut app, mut ctx, username, repo_name, id, .closed)
+}
+
+@['/:username/:repo_name/issue/:id/reopen'; post]
+pub fn (mut app App) handle_reopen_issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	return change_issue_status(mut app, mut ctx, username, repo_name, id, .open)
+}
+
+fn change_issue_status(mut app App, mut ctx Context, username string, repo_name string, id string, status IssueStatus) veb.Result {
+	if !ctx.logged_in {
+		return ctx.redirect_to_login()
+	}
+	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
+	issue := app.find_issue_by_id(id.int()) or { return ctx.not_found() }
+	if issue.repo_id != repo.id || issue.is_pr {
+		return ctx.not_found()
+	}
+	if issue.author_id != ctx.user.id && !app.user_can_write_repo(ctx.user.id, repo) {
+		return ctx.not_found()
+	}
+	if issue.status == status {
+		return ctx.redirect('/${username}/${repo_name}/issue/${issue.id}')
+	}
+	app.set_issue_status(issue.id, status) or {
+		ctx.error('Could not update issue status')
+		return app.issue(mut ctx, username, repo_name, id)
+	}
+	app.sync_repo_open_issue_count(repo.id) or { app.info(err.str()) }
+	action := if status == .closed { 'closed' } else { 'reopened' }
+	app.dispatch_webhook(repo.id, 'issue', WebhookIssuePayload{
+		action: action
+		repo:   '${username}/${repo_name}'
+		title:  issue.title
+		author: ctx.user.username
+	})
+	return ctx.redirect('/${username}/${repo_name}/issue/${issue.id}')
 }
 
 @['/:username/issues/:tab']
@@ -182,7 +302,7 @@ pub fn (mut app App) user_issues(mut ctx Context, username string, tab string) v
 		'created'
 	}
 	mut issues := match current_tab {
-		'assigned' { []Issue{} }
+		'assigned' { app.find_user_assigned_issues(user.id) }
 		'mentioned' { app.find_user_mentioned_issues(user.username) }
 		'activity' { app.find_user_recent_issues(user.id) }
 		else { app.find_user_issues(user.id) }

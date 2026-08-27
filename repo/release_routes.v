@@ -34,8 +34,6 @@ pub fn (mut app App) releases(mut ctx Context, username string, repo_name string
 	rels := app.find_repo_releases_as_page(repo_id, offset)
 	users := app.find_repo_registered_contributor(repo_id)
 
-	download_archive_prefix := '/${username}/${repo_name}/tag'
-
 	mut rel := Release{}
 	mut tag := Tag{}
 	mut user := User{}

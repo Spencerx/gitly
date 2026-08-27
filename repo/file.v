@@ -3,6 +3,7 @@ module main
 import time
 import math
 import os
+import net.urllib
 
 struct File {
 	id                 int    @[primary; sql: serial]
@@ -24,16 +25,18 @@ mut:
 
 fn (f File) url() string {
 	file_type := if f.is_dir { 'tree' } else { 'blob' }
+	return '${file_type}/${repo_url_path(f.branch)}/${repo_url_path(f.full_path())}'
+}
 
-	if f.parent_path == '' {
-		return '${file_type}/${f.branch}/${f.name}'
-	}
-
-	return '${file_type}/${f.branch}/${f.parent_path}/${f.name}'
+// repo_url_path percent-encodes each Git path component while preserving `/`
+// as the route separator. Repository filenames may legally contain spaces,
+// `#`, `?`, and `%`; interpolating them raw changes the URL's meaning.
+fn repo_url_path(value string) string {
+	return value.split('/').map(urllib.path_escape(it)).join('/')
 }
 
 fn (f &File) full_path() string {
-	if f.parent_path == '' {
+	if f.parent_path == '' || f.parent_path == '.' {
 		return f.name
 	}
 
@@ -115,14 +118,15 @@ fn (mut app App) find_repository_items(repo_id int, branch string, parent_path s
 }
 
 fn (mut app App) find_repo_file_by_path(repo_id int, item_branch string, path string) ?File {
-	mut valid_parent_path := os.dir(path)
-	item_name := path.after('/')
+	normalized_path := path.trim_string_left('/')
+	mut valid_parent_path := os.dir(normalized_path)
+	item_name := os.base(normalized_path)
 
-	if valid_parent_path == '' || valid_parent_path == '/' {
+	if valid_parent_path == '' || valid_parent_path == '/' || valid_parent_path == normalized_path {
 		valid_parent_path = '.'
 	}
 
-	app.info('find file repo_id=${repo_id} parent_path = ${valid_parent_path} branch=${item_branch} name=${item_branch}')
+	app.info('find file repo_id=${repo_id} parent_path=${valid_parent_path} branch=${item_branch} name=${item_name}')
 
 	files := sql app.db {
 		select from File where repo_id == repo_id && parent_path == valid_parent_path

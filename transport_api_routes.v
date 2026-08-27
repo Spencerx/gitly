@@ -44,6 +44,11 @@ struct ApiMirrorView {
 	is_syncing           bool
 }
 
+struct ApiForkSyncView {
+	updated []string
+	skipped []string
+}
+
 @['/api/v1/repos/:username/:repo_name/pulls'; post]
 pub fn (mut app App) api_v1_create_cross_repo_pull(mut ctx Context, username string, repo_name string) veb.Result {
 	user := app.api_user_from_ctx(ctx) or { return ctx.api_unauthorized() }
@@ -98,6 +103,15 @@ pub fn (mut app App) api_v1_create_cross_repo_pull(mut ctx Context, username str
 		return ctx.transport_api_error(409, err.str())
 	}
 	app.increment_repo_open_prs(target.id) or {}
+	app.dispatch_webhook(target.id, 'pr', WebhookPrPayload{
+		action: 'opened'
+		repo:   '${username}/${repo_name}'
+		number: pr_id
+		title:  title
+		author: user.username
+		head:   head
+		base:   base
+	})
 	return ctx.json(app.pr_to_api(pr))
 }
 
@@ -147,11 +161,15 @@ fn (mirror RepoMirror) to_api() ApiMirrorView {
 }
 
 fn (mut ctx Context) transport_api_error(code int, message string) veb.Result {
-	ctx.send_custom_error(code, message)
-	return ctx.json({
-		'success': 'false'
-		'message': message
-	})
+	status_text := match code {
+		400 { 'Bad Request' }
+		401 { 'Unauthorized' }
+		403 { 'Forbidden' }
+		404 { 'Not Found' }
+		409 { 'Conflict' }
+		else { 'Internal Server Error' }
+	}
+	return ctx.api_error_response(code, status_text, message)
 }
 
 @['/api/v1/user/ssh-keys']
@@ -189,9 +207,7 @@ pub fn (mut app App) api_v1_delete_user_ssh_key(mut ctx Context, id string) veb.
 	app.remove_ssh_key(user.id, key.id) or {
 		return ctx.transport_api_error(500, 'Could not delete SSH key')
 	}
-	return ctx.json({
-		'success': 'true'
-	})
+	return ctx.api_success_response()
 }
 
 @['/api/v1/repos/:username/:repo_name/deploy-keys']
@@ -247,9 +263,7 @@ pub fn (mut app App) api_v1_delete_repo_deploy_key(mut ctx Context, username str
 	app.remove_deploy_key(repo.id, key.id) or {
 		return ctx.transport_api_error(500, 'Could not delete deploy key')
 	}
-	return ctx.json({
-		'success': 'true'
-	})
+	return ctx.api_success_response()
 }
 
 @['/api/v1/repos/:username/:repo_name/forks']
@@ -324,9 +338,9 @@ pub fn (mut app App) api_v1_sync_repo_fork(mut ctx Context, username string, rep
 	result := app.sync_fork(repo, relation, ctx.form['default_branch_only'] == 'true') or {
 		return ctx.transport_api_error(409, err.str())
 	}
-	return ctx.json({
-		'updated': result.updated.join(',')
-		'skipped': result.skipped.join(',')
+	return ctx.json(ApiForkSyncView{
+		updated: result.updated
+		skipped: result.skipped
 	})
 }
 
@@ -351,13 +365,12 @@ pub fn (mut app App) api_v1_add_repo_mirror(mut ctx Context, username string, re
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
 		return ctx.transport_api_error(403, 'Maintainer access is required')
 	}
-	app.add_repo_mirror(repo.id, user.id, ctx.form['url'], ctx.form['mirror_username'],
-		ctx.form['mirror_password'], ctx.form['ssh_private_key'], ctx.form['ssh_known_hosts'],
-		ctx.form['direction'], ctx.form['overwrite_diverged'] == 'true',
-		ctx.form['only_protected'] == 'true', ctx.form['interval_minutes'].int()) or {
-		return ctx.transport_api_error(400, err.str())
-	}
-	mirror := app.find_repo_mirror(db_last_insert_id(mut app.db)) or { return ctx.api_not_found() }
+	mirror_id := app.add_repo_mirror(repo.id, user.id, ctx.form['url'],
+		ctx.form['mirror_username'], ctx.form['mirror_password'], ctx.form['ssh_private_key'],
+		ctx.form['ssh_known_hosts'], ctx.form['direction'],
+		ctx.form['overwrite_diverged'] == 'true', ctx.form['only_protected'] == 'true',
+		ctx.form['interval_minutes'].int()) or { return ctx.transport_api_error(400, err.str()) }
+	mirror := app.find_repo_mirror(mirror_id) or { return ctx.api_not_found() }
 	return ctx.json(mirror.to_api())
 }
 
@@ -395,7 +408,5 @@ pub fn (mut app App) api_v1_delete_repo_mirror(mut ctx Context, username string,
 	app.delete_repo_mirror(repo.id, mirror.id) or {
 		return ctx.transport_api_error(500, 'Could not delete mirror')
 	}
-	return ctx.json({
-		'success': 'true'
-	})
+	return ctx.api_success_response()
 }

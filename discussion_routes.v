@@ -14,6 +14,10 @@ struct DiscussionCommentWithUser {
 	user User
 }
 
+fn (app &App) can_manage_discussion(ctx Context, repo Repo, discussion Discussion) bool {
+	return ctx.logged_in && (discussion.author_id == ctx.user.id || app.can_admin_repo(ctx, repo))
+}
+
 @['/:username/:repo_name/discussions']
 pub fn (mut app App) handle_get_repo_discussions(mut ctx Context, username string, repo_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
@@ -100,8 +104,7 @@ pub fn (mut app App) view_discussion(mut ctx Context, username string, repo_name
 			user: u
 		}
 	}
-	is_owner := ctx.logged_in && (app.can_admin_repo(ctx, repo)
-		|| discussion.author_id == ctx.user.id)
+	is_owner := app.can_manage_discussion(ctx, repo, discussion)
 	return $veb.html('templates/discussion.html')
 }
 
@@ -142,7 +145,7 @@ pub fn (mut app App) handle_lock_discussion(mut ctx Context, username string, re
 	if discussion.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if !app.can_admin_repo(ctx, repo) {
+	if !app.can_manage_discussion(ctx, repo, discussion) {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	app.set_discussion_lock(discussion.id, !discussion.is_locked) or {}
@@ -162,7 +165,7 @@ pub fn (mut app App) handle_delete_discussion(mut ctx Context, username string, 
 	if discussion.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if !app.can_admin_repo(ctx, repo) && discussion.author_id != ctx.user.id {
+	if !app.can_manage_discussion(ctx, repo, discussion) {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	app.delete_discussion(discussion.id) or {}
@@ -182,7 +185,7 @@ pub fn (mut app App) handle_mark_answer(mut ctx Context, username string, repo_n
 	if discussion.repo_id != repo.id {
 		return ctx.not_found()
 	}
-	if discussion.author_id != ctx.user.id && !app.can_admin_repo(ctx, repo) {
+	if !app.can_manage_discussion(ctx, repo, discussion) {
 		return ctx.redirect('/${username}/${repo_name}/discussions/${id}')
 	}
 	comment := app.find_discussion_comment(cid.int()) or { return ctx.not_found() }

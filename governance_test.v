@@ -65,6 +65,23 @@ fn test_project_roles_separate_read_write_and_admin_access() {
 		assert app.repo_access_level(3, repo) < project_access_maintainer
 		assert app.repo_access_level(4, repo) == project_access_maintainer
 		assert !app.user_has_repo_read_access(99, repo)
+
+		owner_ctx := Context{
+			logged_in: true
+			user:      User{
+				id: 1
+			}
+		}
+		maintainer_ctx := Context{
+			logged_in: true
+			user:      User{
+				id: 4
+			}
+		}
+		assert app.can_admin_repo(owner_ctx, repo)
+		assert app.can_own_repo(owner_ctx, repo)
+		assert app.can_admin_repo(maintainer_ctx, repo)
+		assert !app.can_own_repo(maintainer_ctx, repo)
 	} $else {
 		assert true
 	}
@@ -106,19 +123,52 @@ fn test_protected_branch_wildcards_and_access_rules() {
 	}
 }
 
+fn test_protected_branch_patterns_reject_invalid_git_ref_characters() {
+	assert valid_protected_branch_pattern('release/*')
+	assert valid_protected_branch_pattern('feature/team-*')
+	for invalid in ['@', 'release/.hidden', 'release/foo~1', 'release/foo^1', 'release/foo:bar',
+		'release/foo.lock', 'release/foo.', 'release//next', 'release/@{next}'] {
+		assert !valid_protected_branch_pattern(invalid)
+	}
+	mut control_bytes := 'release/x'.bytes()
+	control_bytes << u8(1)
+	control_character := control_bytes.bytestr()
+	assert !valid_protected_branch_pattern(control_character)
+}
+
 fn test_merge_approvals_are_unique_and_can_be_invalidated() {
 	$if sqlite ? {
 		mut app, db_path := governance_test_app()!
+		repo_root := os.join_path(os.temp_dir(), 'gitly_governance_approval_${os.getpid()}')
+		work_dir := os.join_path(repo_root, 'work')
+		bare_dir := os.join_path(repo_root, 'project.git')
+		os.rmdir_all(repo_root) or {}
+		os.mkdir_all(repo_root)!
 		defer {
 			app.db.close() or {}
+			os.rmdir_all(repo_root) or {}
 			for suffix in ['', '-shm', '-wal'] {
 				os.rm(db_path + suffix) or {}
 			}
 		}
+		assert git.Git.exec(['init', '-b', 'main', work_dir]).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['config', 'user.name', 'Tester']).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['config', 'user.email', 'tester@example.com']).exit_code == 0
+		os.write_file(os.join_path(work_dir, 'README.md'), 'base\n')!
+		assert git.Git.exec_in_dir(work_dir, ['add', 'README.md']).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['commit', '-m', 'base']).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['checkout', '-b', 'feature']).exit_code == 0
+		os.write_file(os.join_path(work_dir, 'feature.txt'), 'feature\n')!
+		assert git.Git.exec_in_dir(work_dir, ['add', 'feature.txt']).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['commit', '-m', 'feature']).exit_code == 0
+		assert git.Git.exec(['init', '--bare', bare_dir]).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['remote', 'add', 'origin', bare_dir]).exit_code == 0
+		assert git.Git.exec_in_dir(work_dir, ['push', 'origin', 'main', 'feature']).exit_code == 0
 		insert_governance_test_user(mut app, 1, 'owner')!
 		insert_governance_test_user(mut app, 2, 'reviewer')!
 		app.add_repo(Repo{
 			id:                 1
+			git_dir:            bare_dir
 			name:               'project'
 			user_id:            1
 			user_name:          'owner'
@@ -174,6 +224,7 @@ fn test_protected_branch_hook_rejects_force_pushes() {
 		app.protect_branch(1, 'main', project_access_maintainer, project_access_maintainer)!
 		repo := app.find_repo_by_id(1) or { panic('repo missing') }
 		app.ensure_protected_branch_hook(repo)!
+		assert git.Git.exec_in_dir(bare, ['config', '--get', 'core.hooksPath']).output.trim_space() == '.gitly-hooks'
 		environment := {
 			'GITLY_PROTECTED_BRANCH_RULES': app.protected_branch_rules_env(1)
 			'GITLY_USER_ACCESS_LEVEL':      project_access_owner.str()

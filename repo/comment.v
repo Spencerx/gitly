@@ -38,6 +38,14 @@ pub fn (mut app App) handle_add_comment(username string, repo_name string) veb.R
 	}
 	// TODO: count comments
 	app.increment_issue_comments(issue.id) or { app.info(err.str()) }
+	app.dispatch_webhook(repo.id, 'comment', WebhookCommentPayload{
+		action: 'created'
+		repo:   '${username}/${repo_name}'
+		target: 'issue'
+		number: issue.id
+		author: ctx.user.username
+		text:   text
+	})
 	return ctx.redirect('/${username}/${repo_name}/issue/${issue_id}')
 }
 
@@ -56,7 +64,7 @@ fn (mut app App) add_issue_comment(author_id int, issue_id int, text string) ! {
 
 fn (mut app App) get_all_issue_comments(issue_id int) []Comment {
 	comments := sql app.db {
-		select from Comment where issue_id == issue_id
+		select from Comment where issue_id == issue_id order by id
 	} or { []Comment{} }
 
 	return comments

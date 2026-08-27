@@ -2,6 +2,30 @@
 	margin: 20px 0 16px;
 }
 
+.issue-state-tabs {
+	display: flex;
+	gap: 4px;
+	margin: 0 0 14px;
+	border-bottom: 1px solid #d0d7de;
+}
+
+.issue-state-tab {
+	padding: 8px 12px;
+	color: #57606a;
+	text-decoration: none;
+	border-bottom: 2px solid transparent;
+}
+
+.issue-state-tab:hover {
+	color: #24292f;
+}
+
+.issue-state-tab--active {
+	color: #24292f;
+	font-weight: 600;
+	border-bottom-color: #fd8c73;
+}
+
 .issue-header__title {
 	font-size: 24px;
 	font-weight: 600;
@@ -199,6 +223,87 @@
 		background-color: #1a7f37;
 		border-color: rgba(27, 31, 36, 0.15);
 		color: #fff;
+	}
+}
+
+.issue-assignees {
+	margin: 0 0 18px 54px;
+	padding: 12px 14px;
+	border: 1px solid #d0d7de;
+	border-radius: 6px;
+	background: #f6f8fa;
+}
+
+.issue-assignees__header {
+	display: flex;
+	align-items: baseline;
+	gap: 8px;
+	margin-bottom: 8px;
+	color: #57606a;
+
+	h2 {
+		margin: 0;
+		font-size: 14px;
+		color: #24292f;
+	}
+}
+
+.issue-assignees__list {
+	display: flex;
+	flex-wrap: wrap;
+	gap: 8px;
+}
+
+.issue-assignee {
+	display: flex;
+	align-items: center;
+	gap: 6px;
+	padding: 4px 6px;
+	border: 1px solid #d0d7de;
+	border-radius: 4px;
+	background: #fff;
+}
+
+.issue-assignee__user {
+	display: flex;
+	align-items: center;
+	gap: 5px;
+	font-weight: 600;
+	text-decoration: none;
+
+	img {
+		width: 20px;
+		height: 20px;
+		border-radius: 50%;
+	}
+}
+
+.issue-assignee__remove {
+	padding: 2px 5px;
+	font-size: 12px;
+}
+
+.issue-assignees__form {
+	display: flex;
+	align-items: center;
+	flex-wrap: wrap;
+	gap: 8px;
+	margin-top: 10px;
+
+	label {
+		font-size: 13px;
+		font-weight: 600;
+	}
+
+	select,
+	button {
+		width: auto;
+	}
+}
+
+@media (max-width: 600px) {
+	.issue-assignees {
+		margin-left: 0;
 	}
 }
 

@@ -125,6 +125,18 @@ fn test_forks_track_lineage_and_only_fast_forward_from_upstream() {
 			'rev-parse',
 			'main',
 		])
+
+		missing_source := RepoFork{
+			...relation
+			source_repo_id: 999_999
+		}
+		mut missing_source_rejected := false
+		app.sync_fork(created, missing_source, false) or { missing_source_rejected = true }
+		assert missing_source_rejected
+		stored_relation := app.find_fork_by_repo(created.id) or {
+			panic('fork relationship missing')
+		}
+		assert stored_relation.last_sync_error == 'The upstream repository no longer exists'
 	} $else {
 		assert true
 	}
@@ -200,6 +212,39 @@ fn test_ssh_mirror_endpoint_requires_pinned_auth_material() {
 	assert !is_safe_mirror_endpoint(clean, [])
 }
 
+fn test_ssh_mirror_usernames_cannot_be_interpreted_as_ssh_options() {
+	assert valid_ssh_mirror_username('git')
+	assert valid_ssh_mirror_username('deploy-user')
+	assert !valid_ssh_mirror_username('-oProxyCommand=evil')
+	assert !valid_ssh_mirror_username('git user')
+	assert !valid_ssh_mirror_username('git@example')
+}
+
+fn test_mirror_auth_files_are_private() {
+	secret := 'mirror-auth-file-secret-that-is-long-enough'
+	app := App{
+		config: config.Config{
+			storage_secret: secret
+		}
+	}
+	mirror := RepoMirror{
+		url:               'ssh://git@example.test/team/project.git'
+		encrypted_ssh_key: encrypt_mirror_secret(secret, 'private-key-material')!
+		ssh_known_hosts:   'example.test ssh-ed25519 AAAATEST'
+		interval_minutes:  5
+	}
+	_, paths := prepare_mirror_auth(&app, mirror)!
+	defer {
+		for path in paths {
+			os.rm(path) or {}
+		}
+	}
+	assert paths.len == 3
+	for path in paths {
+		assert os.stat(path)!.mode & u32(0o077) == 0
+	}
+}
+
 fn test_cross_fork_merge_request_refreshes_head_and_invalidates_approvals() {
 	$if sqlite ? {
 		root := os.join_path(os.temp_dir(), 'gitly_cross_fork_pr_${os.getpid()}')
@@ -242,16 +287,20 @@ fn test_cross_fork_merge_request_refreshes_head_and_invalidates_approvals() {
 		pr_id := app.add_pull_request_from_repo(source.id, created.id, 2, 'Feature', '', 'feature',
 			'main')!
 		pr := app.find_pull_request_by_id(pr_id) or { panic('PR missing') }
-		app.refresh_cross_fork_pr_head(source, pr)!
+		app.refresh_open_cross_fork_pr_heads(created.id, 'feature')
 		assert transport_git(['-C', source.git_dir, 'rev-parse', pr.head_ref()]) == feature_sha
 		assert source.list_commits_between('main', pr.head_ref()).len == 1
 
 		app.add_project_member(source.id, 3, 'developer')!
 		app.approve_pull_request(pr.id, 3)!
 		assert app.pull_request_approval_count(pr.id) == 1
-		app.clear_open_pr_approvals_for_head(created.id, 'feature')!
+		updated_feature_sha := transport_commit(fork_work, 'updated feature\n', 'update feature')
+		transport_git(['-C', fork_work, 'push', 'origin', 'feature'])
+		app.refresh_cross_fork_pr_head(source, pr)!
+		assert transport_git(['-C', source.git_dir, 'rev-parse', pr.head_ref()]) == updated_feature_sha
 		assert app.pull_request_approval_count(pr.id) == 0
-		merge_sha := merge_branches_in_bare(source, 'main', pr.head_ref(), 'Reviewer', 'merge')!
+		merge_sha := merge_branches_in_bare_at_head(source, 'main', pr.head_ref(),
+			updated_feature_sha, 'Reviewer', 'merge')!
 		assert transport_git(['-C', source.git_dir, 'rev-parse', 'main']) == merge_sha
 	} $else {
 		assert true

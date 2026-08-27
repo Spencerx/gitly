@@ -38,19 +38,14 @@ fn (p &Project) formatted_name() veb.RawHtml {
 }
 
 fn (mut app App) add_project(repo_id int, name string, description string) !int {
-	pr := Project{
-		repo_id:     repo_id
-		name:        name
-		description: description
-		created_at:  int(time.now().unix())
-	}
-	sql app.db {
-		insert pr into Project
-	}!
-	project_id := db_last_insert_id(mut app.db)
+	project_id := db_insert_returning_id(mut app.db, 'Project', ['repo_id', 'name', 'description',
+		'created_at'], [repo_id.str(), name, description, int(time.now().unix()).str()])!
 	if project_id != 0 {
 		for i, col_name in ['Todo', 'In progress', 'Done'] {
-			app.add_project_column(project_id, col_name, i) or {}
+			app.add_project_column(project_id, col_name, i) or {
+				app.delete_project(project_id) or {}
+				return err
+			}
 		}
 	}
 	return project_id
@@ -95,15 +90,11 @@ fn (mut app App) delete_repo_projects(repo_id int) ! {
 }
 
 fn (mut app App) add_project_column(project_id int, name string, position int) !int {
-	c := ProjectColumn{
-		project_id: project_id
-		name:       name
-		position:   position
-	}
-	sql app.db {
-		insert c into ProjectColumn
-	}!
-	return db_last_insert_id(mut app.db)
+	return db_insert_returning_id(mut app.db, 'ProjectColumn', ['project_id', 'name', 'position'], [
+		project_id.str(),
+		name,
+		position.str(),
+	])
 }
 
 fn (mut app App) list_project_columns(project_id int) []ProjectColumn {

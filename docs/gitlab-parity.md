@@ -11,8 +11,8 @@ Gitly is a lightweight forge, while GitLab is a much larger DevSecOps platform. 
 - Project roles: Reporter (read/clone), Developer (push to permitted branches), and Maintainer (project settings)
 - Protected branches with exact or wildcard rules, role-based push and merge access, deletion protection, and force-push rejection
 - Merge requests with discussions, line reviews, approvals, approval invalidation after new commits, merge and squash merge
-- Issues, labels, milestones, project boards, discussions, releases, activity feeds, stars, watches, and webhooks
-- API/session tokens, TOTP, security logs, GitHub OAuth, SQLite/PostgreSQL, and optional external CI status integration
+- Issues with assignees, labels, milestones, project boards, discussions, releases, activity feeds, stars, watches, and webhooks
+- Scoped/expiring personal access tokens, sessions, TOTP, security logs, immutable GitHub OAuth identities, SQLite/PostgreSQL, and optional external CI status integration
 
 The governance and repository model follows GitLab's documented [project roles](https://docs.gitlab.com/user/permissions/), [project members](https://docs.gitlab.com/user/project/members/), [protected branches](https://docs.gitlab.com/user/project/repository/branches/protected/), [merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/), [SSH keys](https://docs.gitlab.com/user/ssh/), [deploy keys](https://docs.gitlab.com/user/project/deploy_keys/), [fork workflows](https://docs.gitlab.com/user/project/repository/forking_workflow/), and [repository mirrors](https://docs.gitlab.com/user/project/repository/mirror/).
 
@@ -20,7 +20,7 @@ The governance and repository model follows GitLab's documented [project roles](
 
 These are not small checkboxes; each requires storage, permissions, APIs, background workers, operational controls, and tests.
 
-1. Native CI/CD: runners, pipelines and DAGs, job logs/artifacts/cache, schedules, variables/secrets, manual jobs, environments, deployments, and merge trains.
+1. Native CI/CD: isolated runners (the separate shell runner is not a safe production sandbox for untrusted repository jobs), pipelines and DAGs, job logs/artifacts/cache, schedules, variables/secrets, manual jobs, environments, deployments, and merge trains.
 2. Remaining repository management: deploy tokens, SSH signature verification and signed-commit policy, protected tags/releases, snippets, LFS, partial clone, and repository housekeeping.
 3. Planning: nested groups, epics, roadmaps, iterations, tasks, time tracking, issue relationships, scoped labels, service desk, and advanced boards.
 4. Package delivery: package, container, and dependency-proxy registries with retention, authentication, and provenance.

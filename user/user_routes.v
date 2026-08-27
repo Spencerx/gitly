@@ -46,14 +46,15 @@ pub fn (mut app App) handle_login(mut ctx Context, username string, password str
 	if user.is_blocked {
 		return ctx.redirect_to_login()
 	}
+	now := time.now().unix()
+	if user_login_is_throttled(user, now) {
+		ctx.error('Wrong username/password')
+		return app.login(mut ctx)
+	}
 	if !compare_password_with_hash(password, user.salt, user.password) {
-		app.increment_user_login_attempts(user.id) or {
+		app.record_failed_login(user.id, now) or {
 			ctx.error('There was an error while logging in')
 			return app.login(mut ctx)
-		}
-		if user.login_attempts == max_login_attempts {
-			app.warn('User ${user.username} got blocked')
-			app.block_user(user.id) or { app.info(err.str()) }
 		}
 		ctx.error('Wrong username/password')
 		return app.login(mut ctx)
@@ -220,17 +221,9 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 			return app.user_settings(mut ctx, username)
 		}
 
-		app.rename_user_directory(username, new_username) or {
-			ctx.error('There was an error while moving your repositories')
-			return app.user_settings(mut ctx, username)
-		}
-		app.change_username(ctx.user.id, username, new_username) or {
-			app.rename_user_directory(new_username, username) or {}
+		app.rename_user_account(ctx.user.id, username, new_username) or {
 			ctx.error('There was an error while updating the settings')
-			return app.user_settings(mut ctx, username)
-		}
-		app.incement_namechanges(ctx.user.id) or {
-			ctx.error('There was an error while updating the settings')
+			app.warn('Could not rename user ${username} to ${new_username}: ${err}')
 			return app.user_settings(mut ctx, username)
 		}
 	}
@@ -238,16 +231,30 @@ pub fn (mut app App) handle_update_user_settings(mut ctx Context, username strin
 	return ctx.redirect('/${new_username}')
 }
 
-fn (mut app App) rename_user_directory(old_name string, new_name string) ! {
+fn (mut app App) rename_user_directory(old_name string, new_name string) !bool {
 	old_path := os.join_path(app.config.repo_storage_path, old_name)
 	new_path := os.join_path(app.config.repo_storage_path, new_name)
-	if !os.exists(old_path) {
-		return
-	}
 	if os.exists(new_path) {
 		return error('destination repository directory already exists')
 	}
+	if !os.exists(old_path) {
+		return false
+	}
 	os.mv(old_path, new_path)!
+	return true
+}
+
+fn (mut app App) rename_user_account(user_id int, old_name string, new_name string) ! {
+	directory_moved := app.rename_user_directory(old_name, new_name)!
+	app.change_username(user_id, old_name, new_name) or {
+		database_error := err
+		if directory_moved {
+			app.rename_user_directory(new_name, old_name) or {
+				return error('${database_error.msg()}; repository directory rollback failed: ${err.msg()}')
+			}
+		}
+		return database_error
+	}
 }
 
 pub fn (mut app App) register(mut ctx Context) veb.Result {
@@ -277,11 +284,6 @@ fn (mut app App) register_failed(mut ctx Context, no_redirect string, msg string
 
 @['/register'; post]
 pub fn (mut app App) handle_register(mut ctx Context, username string, email string, password string, no_redirect string) veb.Result {
-	user_count := app.get_users_count_with_reconnect() or {
-		eprintln('[register] get_users_count failed: ${err}')
-		return app.register_failed(mut ctx, no_redirect, 'Failed to register: ${err}')
-	}
-	no_users := user_count == 0
 	clean_username := username.trim_space().to_lower()
 	clean_email := email.trim_space().to_lower()
 	if clean_username == '' || clean_email == '' {
@@ -343,7 +345,7 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 	// TODO: refactor
 	is_registered := app.register_user(clean_username, hashed_password, salt, [
 		clean_email,
-	], false, no_users) or {
+	], false, false) or {
 		eprintln('[register] register_user failed for username=${clean_username}: ${err}')
 		msg := if is_unique_constraint_error(err) {
 			'Username `${clean_username}` or email `${clean_email}` is already in use'
@@ -363,8 +365,11 @@ pub fn (mut app App) handle_register(mut ctx Context, username string, email str
 		return app.register_failed(mut ctx, no_redirect, 'User already exists')
 	}
 
-	if no_users {
-		app.add_admin(user.id) or { app.info(err.str()) }
+	// Claim only after the complete user registration succeeds. Failed or
+	// partial registrations therefore cannot reserve bootstrap permanently.
+	// The database's unique bootstrap marker decides concurrent claims.
+	app.claim_bootstrap_administrator(user.id) or {
+		app.warn('Could not claim bootstrap administrator for user ${user.id}: ${err}')
 	}
 
 	client_ip := ctx.ip()

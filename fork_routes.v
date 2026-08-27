@@ -91,7 +91,7 @@ pub fn (mut app App) handle_sync_fork(mut ctx Context, username string, repo_nam
 	}
 	result := app.sync_fork(repo, relation, ctx.form['default_branch_only'] == 'on') or {
 		ctx.error(err.str())
-		return app.tree(mut ctx, username, repo_name, repo.primary_branch, '')
+		return app.tree(mut ctx, username, repo_name, repo.primary_branch)
 	}
 	app.info('Fork sync updated ${result.updated.len} branch(es) and left ${result.skipped.len} diverged branch(es) unchanged')
 	return ctx.redirect('/${username}/${repo_name}')

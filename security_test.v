@@ -28,6 +28,17 @@ fn test_is_valid_repo_file_path_rejects_dangerous_paths() {
 	assert !is_valid_repo_file_path('a\tb') // tab / control char
 }
 
+fn test_repository_url_paths_escape_special_filename_characters() {
+	assert repo_url_path('feature/api') == 'feature/api'
+	assert repo_url_path('docs/a file#1?.md') == 'docs/a%20file%231%3F.md'
+	file := File{
+		branch:      'refs/tags/release/v1'
+		parent_path: 'docs'
+		name:        'a file#1?.md'
+	}
+	assert file.url() == 'blob/refs/tags/release/v1/docs/a%20file%231%3F.md'
+}
+
 fn test_is_safe_ref_accepts_normal_branches() {
 	assert is_safe_ref('master')
 	assert is_safe_ref('feature/new-thing')
@@ -132,6 +143,41 @@ fn test_user_content_size_limits() {
 	assert !valid_comment('x'.repeat(max_comment_len + 1))
 	assert valid_body('x'.repeat(max_body_len))
 	assert !valid_body('x'.repeat(max_body_len + 1))
+}
+
+fn test_webhook_events_are_normalized_and_restricted() {
+	assert normalize_webhook_events(' issue, push,issue ')! == 'issue,push'
+	assert normalize_webhook_events('')! == 'push,issue,pr,comment,release'
+	mut rejected := false
+	normalize_webhook_events('push,unknown') or { rejected = true }
+	assert rejected
+}
+
+fn test_login_throttle_expires_without_changing_admin_block_status() {
+	now := i64(2_000_000)
+	user := User{
+		is_blocked:            false
+		login_throttled_until: now + login_throttle_seconds
+	}
+	assert user_login_is_throttled(user, now)
+	assert !user_login_is_throttled(user, now + login_throttle_seconds)
+	assert !user.is_blocked
+}
+
+fn test_daily_post_limit_expires_after_twenty_four_hours() {
+	now := 2_000_000
+	active := User{
+		posts_count:    posts_per_day
+		last_post_time: now - 60
+	}
+	expired := User{
+		posts_count:    posts_per_day
+		last_post_time: now - 24 * 60 * 60
+	}
+
+	assert user_reached_post_limit(active, now)
+	assert !user_reached_post_limit(expired, now)
+	assert user_post_window_expired(expired, now)
 }
 
 fn test_ssh_public_key_shape_validation() {

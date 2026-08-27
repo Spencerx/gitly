@@ -54,7 +54,13 @@ pub fn (mut app App) handle_two_factor_login(mut ctx Context, code string) veb.R
 	pending := ctx.get_cookie(two_factor_pending_cookie) or { return ctx.redirect_to_login() }
 	user := app.verify_pending_2fa(pending) or { return ctx.redirect_to_login() }
 	tf := app.find_two_factor(user.id) or { return ctx.redirect_to_login() }
+	now := time.now().unix()
+	if user_login_is_throttled(user, now) {
+		ctx.error('Invalid verification code')
+		return $veb.html('templates/two_factor_login.html')
+	}
 	if !tf.is_enabled || !verify_totp(tf.secret, code.trim_space()) {
+		app.record_failed_login(user.id, now) or { app.info(err.str()) }
 		ctx.error('Invalid verification code')
 		return $veb.html('templates/two_factor_login.html')
 	}
@@ -109,11 +115,18 @@ pub fn (mut app App) handle_enable_two_factor(mut ctx Context, username string) 
 	}
 	code := ctx.form['code'].trim_space()
 	tf := app.find_two_factor(ctx.user.id) or { return ctx.redirect('/${username}/settings/2fa') }
-	if !verify_totp(tf.secret, code) {
+	now := time.now().unix()
+	if user_login_is_throttled(ctx.user, now) {
 		ctx.error('Invalid verification code')
-		return ctx.redirect('/${username}/settings/2fa')
+		return app.view_two_factor_settings(mut ctx, username)
+	}
+	if !verify_totp(tf.secret, code) {
+		app.record_failed_login(ctx.user.id, now) or { app.info(err.str()) }
+		ctx.error('Invalid verification code')
+		return app.view_two_factor_settings(mut ctx, username)
 	}
 	app.upsert_two_factor(ctx.user.id, tf.secret, true) or {}
+	app.reset_user_login_throttle(ctx.user.id) or { app.info(err.str()) }
 	return ctx.redirect('/${username}/settings/2fa')
 }
 
@@ -122,6 +135,21 @@ pub fn (mut app App) handle_disable_two_factor(mut ctx Context, username string)
 	if !ctx.logged_in || ctx.user.username != username {
 		return ctx.redirect_to_index()
 	}
-	app.delete_two_factor(ctx.user.id) or {}
+	tf := app.find_two_factor(ctx.user.id) or { return ctx.redirect('/${username}/settings/2fa') }
+	now := time.now().unix()
+	if user_login_is_throttled(ctx.user, now) {
+		ctx.error('A current verification code is required to disable two-factor authentication')
+		return app.view_two_factor_settings(mut ctx, username)
+	}
+	if !tf.is_enabled || !verify_totp(tf.secret, ctx.form['code'].trim_space()) {
+		app.record_failed_login(ctx.user.id, now) or { app.info(err.str()) }
+		ctx.error('A current verification code is required to disable two-factor authentication')
+		return app.view_two_factor_settings(mut ctx, username)
+	}
+	app.delete_two_factor(ctx.user.id) or {
+		ctx.error('Could not disable two-factor authentication')
+		return app.view_two_factor_settings(mut ctx, username)
+	}
+	app.reset_user_login_throttle(ctx.user.id) or { app.info(err.str()) }
 	return ctx.redirect('/${username}/settings/2fa')
 }

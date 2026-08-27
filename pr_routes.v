@@ -7,6 +7,8 @@ import validation
 import git
 import time
 import strings
+import os
+import io.util
 
 struct PrWithUser {
 	pr   PullRequest
@@ -353,7 +355,6 @@ pub fn (mut app App) pull_request(mut ctx Context, username string, repo_name st
 	} else {
 		repo
 	}
-	app.refresh_cross_fork_pr_head(repo, pr) or { ctx.error(err.str()) }
 	commits := repo.list_commits_between(pr.base_branch, pr.head_ref())
 	comments := app.get_pr_comments(pr.id)
 	reviews := app.get_pr_reviews(pr.id)
@@ -390,10 +391,12 @@ pub fn (mut app App) pull_request(mut ctx Context, username string, repo_name st
 	}
 	timeline.sort(a.created_at < b.created_at)
 	is_repo_owner := app.can_admin_repo(ctx, repo)
-	approval_count := app.pull_request_approval_count(pr.id)
-	approvals := app.find_pull_request_approvals(pr.id)
-	approvals_satisfied := approval_count >= repo.required_approvals
-	has_approved := ctx.logged_in && app.user_approved_pull_request(pr.id, ctx.user.id)
+	current_head_oid := app.pull_request_head_oid(pr) or { '' }
+	approvals := app.find_pull_request_approvals_for_head(pr, current_head_oid)
+	approval_count := approvals.len
+	approvals_satisfied := current_head_oid != '' && approval_count >= repo.required_approvals
+	has_approved := ctx.logged_in
+		&& app.user_approved_pull_request_at_head(pr.id, ctx.user.id, current_head_oid)
 	can_approve := ctx.logged_in && pr.is_open() && pr.author_id != ctx.user.id
 		&& app.repo_access_level(ctx.user.id, repo) >= project_access_developer
 	can_merge_branch := ctx.logged_in
@@ -417,7 +420,6 @@ pub fn (mut app App) pull_request_files(mut ctx Context, username string, repo_n
 		return ctx.not_found()
 	}
 	author := app.get_user_by_id(pr.author_id) or { return ctx.not_found() }
-	app.refresh_cross_fork_pr_head(repo, pr) or { ctx.error(err.str()) }
 	raw_diff := repo.diff_branches(pr.base_branch, pr.head_ref())
 	file_diffs := parse_unified_diff(raw_diff)
 	mut all_adds := 0
@@ -466,6 +468,14 @@ pub fn (mut app App) handle_add_pr_comment(mut ctx Context, username string, rep
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
 	app.increment_pr_comments(pr.id) or { app.info(err.str()) }
+	app.dispatch_webhook(repo.id, 'comment', WebhookCommentPayload{
+		action: 'created'
+		repo:   '${username}/${repo_name}'
+		target: 'pr'
+		number: pr.id
+		author: ctx.user.username
+		text:   text
+	})
 	return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 }
 
@@ -482,6 +492,10 @@ pub fn (mut app App) handle_submit_review(mut ctx Context, username string, repo
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
+	}
+	if !pr.is_open() {
+		ctx.error('Reviews can only be submitted to open merge requests')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}/files')
 	}
 	body := ctx.form['body']
 	state_str := ctx.form['state']
@@ -521,6 +535,9 @@ pub fn (mut app App) handle_submit_review(mut ctx Context, username string, repo
 		file_path := parts[0]
 		side := parts[1]
 		line_no := parts[2].int()
+		if !is_valid_repo_file_path(file_path) || side !in ['old', 'new'] || line_no <= 0 {
+			continue
+		}
 		app.add_pr_review_comment(pr.id, ctx.user.id, review_id, file_path, line_no, side, text) or {
 			continue
 		}
@@ -566,7 +583,7 @@ pub fn (mut app App) handle_revoke_pr_approval(mut ctx Context, username string,
 		return ctx.not_found()
 	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
-	if pr.repo_id != repo.id {
+	if pr.repo_id != repo.id || !pr.is_open() {
 		return ctx.not_found()
 	}
 	app.revoke_pull_request_approval(pr.id, ctx.user.id) or {
@@ -586,7 +603,7 @@ pub fn (mut app App) handle_add_line_comment(mut ctx Context, username string, r
 		return ctx.not_found()
 	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
-	if pr.repo_id != repo.id {
+	if pr.repo_id != repo.id || !pr.is_open() {
 		return ctx.not_found()
 	}
 	file_path := ctx.form['file_path']
@@ -594,7 +611,7 @@ pub fn (mut app App) handle_add_line_comment(mut ctx Context, username string, r
 	line_no := ctx.form['line_number'].int()
 	text := ctx.form['text']
 	if !valid_comment(text) || !is_valid_repo_file_path(file_path) || line_no <= 0
-		|| side !in ['left', 'right'] {
+		|| side !in ['old', 'new'] {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}/files')
 	}
 	app.add_pr_review_comment(pr.id, ctx.user.id, 0, file_path, line_no, side, text) or {
@@ -611,6 +628,9 @@ pub fn (mut app App) handle_close_pr(mut ctx Context, username string, repo_name
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
@@ -637,6 +657,9 @@ pub fn (mut app App) handle_reopen_pr(mut ctx Context, username string, repo_nam
 		return ctx.redirect_to_login()
 	}
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !app.can_read_repo(ctx, repo) {
+		return ctx.not_found()
+	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.not_found() }
 	if pr.repo_id != repo.id {
 		return ctx.not_found()
@@ -684,17 +707,24 @@ pub fn (mut app App) handle_merge_pr(mut ctx Context, username string, repo_name
 	if !pr.is_open() {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
-	if !app.pull_request_approvals_satisfied(pr, repo) {
-		ctx.error('Merge request approvals are still required')
-		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
-	}
 	app.refresh_cross_fork_pr_head(repo, pr) or {
 		ctx.error('Merge failed: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
+	head_oid := app.pull_request_head_oid(pr) or {
+		ctx.error('Merge failed: ${err}')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
+	// Refreshing a fork head can invalidate approvals. Gate the merge only after
+	// that refresh so an approval for an older revision cannot authorize the new
+	// source tip.
+	if !app.pull_request_approvals_satisfied_at_head(pr, repo, head_oid) {
+		ctx.error('Merge request approvals are still required')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
 	merge_message := 'Merge pull request #${pr.id} from ${pr.head_branch}\n\n${pr.title}'
-	merge_hash := merge_branches_in_bare(repo, pr.base_branch, pr.head_ref(), ctx.user.username,
-		merge_message) or {
+	merge_hash := merge_branches_in_bare_at_head(repo, pr.base_branch, pr.head_ref(), head_oid,
+		ctx.user.username, merge_message) or {
 		ctx.error('Merge failed: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
@@ -724,17 +754,21 @@ pub fn (mut app App) handle_squash_pr(mut ctx Context, username string, repo_nam
 	if !pr.is_open() {
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
-	if !app.pull_request_approvals_satisfied(pr, repo) {
-		ctx.error('Merge request approvals are still required')
-		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
-	}
 	app.refresh_cross_fork_pr_head(repo, pr) or {
 		ctx.error('Squash merge failed: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
+	head_oid := app.pull_request_head_oid(pr) or {
+		ctx.error('Squash merge failed: ${err}')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
+	if !app.pull_request_approvals_satisfied_at_head(pr, repo, head_oid) {
+		ctx.error('Merge request approvals are still required')
+		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
+	}
 	merge_message := 'Squash pull request #${pr.id} from ${pr.head_branch}\n\n${pr.title}'
-	merge_hash := squash_branches_in_bare(repo, pr.base_branch, pr.head_ref(), ctx.user.username,
-		merge_message) or {
+	merge_hash := squash_branches_in_bare_at_head(repo, pr.base_branch, pr.head_ref(), head_oid,
+		ctx.user.username, merge_message) or {
 		ctx.error('Squash merge failed: ${err}')
 		return ctx.redirect('/${username}/${repo_name}/pull/${id}')
 	}
@@ -820,40 +854,52 @@ fn (r Repo) diff_branches(base string, head string) string {
 	return r.git('diff --no-color ${base}...${head}')
 }
 
-// merge_branches_in_bare performs a merge inside a bare repo using
-// git merge-tree to compute the resulting tree, then commit-tree
-// and update-ref to advance the base branch. Returns the merge commit hash.
-fn merge_branches_in_bare(repo Repo, base string, head string, author string, message string) !string {
-	if !is_safe_ref(base) || !is_safe_ref(head) {
+// merge_branches_in_bare_at_head performs a merge inside a bare repo using the
+// exact reviewed head OID, then atomically verifies the head and base refs while
+// publishing the result.
+fn merge_branches_in_bare_at_head(repo Repo, base string, head_ref string, expected_head_oid string,
+	author string, message string) !string {
+	if !is_safe_ref(base) || !is_safe_ref(head_ref) || !is_full_git_oid(expected_head_oid) {
 		return error('invalid branch name')
 	}
 	git_dir := repo.git_dir
 	base_sha := git_rev_parse(git_dir, base)!
-	head_sha := git_rev_parse(git_dir, head)!
+	current_head_oid := git_rev_parse(git_dir, head_ref)!
+	if current_head_oid != expected_head_oid {
+		return error('merge request head changed; approval is stale')
+	}
 	// Try fast-forward first: if base is an ancestor of head, fast-forward.
-	if git_is_ancestor(git_dir, base_sha, head_sha) {
-		update_branch_ref(git_dir, base, head_sha)!
-		return head_sha
+	if git_is_ancestor(git_dir, base_sha, expected_head_oid) {
+		update_branch_ref_guarding_head(git_dir, base, expected_head_oid, base_sha, head_ref,
+			expected_head_oid)!
+		return expected_head_oid
 	}
 	// Use modern merge-tree --write-tree (Git >= 2.38).
-	tree_sha := git_merge_tree(git_dir, base_sha, head_sha)!
-	commit_sha := git_commit_tree(git_dir, tree_sha, [base_sha, head_sha], author, message)!
-	update_branch_ref(git_dir, base, commit_sha)!
+	tree_sha := git_merge_tree(git_dir, base_sha, expected_head_oid)!
+	commit_sha :=
+		git_commit_tree(git_dir, tree_sha, [base_sha, expected_head_oid], author, message)!
+	update_branch_ref_guarding_head(git_dir, base, commit_sha, base_sha, head_ref,
+		expected_head_oid)!
 	return commit_sha
 }
 
-// squash_branches_in_bare computes the merge result and writes one new commit
-// on the base branch with only the old base commit as its parent.
-fn squash_branches_in_bare(repo Repo, base string, head string, author string, message string) !string {
-	if !is_safe_ref(base) || !is_safe_ref(head) {
+// squash_branches_in_bare_at_head computes the merge result and writes one new
+// commit on the base branch with only the old base commit as its parent.
+fn squash_branches_in_bare_at_head(repo Repo, base string, head_ref string, expected_head_oid string,
+	author string, message string) !string {
+	if !is_safe_ref(base) || !is_safe_ref(head_ref) || !is_full_git_oid(expected_head_oid) {
 		return error('invalid branch name')
 	}
 	git_dir := repo.git_dir
 	base_sha := git_rev_parse(git_dir, base)!
-	head_sha := git_rev_parse(git_dir, head)!
-	tree_sha := git_merge_tree(git_dir, base_sha, head_sha)!
+	current_head_oid := git_rev_parse(git_dir, head_ref)!
+	if current_head_oid != expected_head_oid {
+		return error('merge request head changed; approval is stale')
+	}
+	tree_sha := git_merge_tree(git_dir, base_sha, expected_head_oid)!
 	commit_sha := git_commit_tree(git_dir, tree_sha, [base_sha], author, message)!
-	update_branch_ref(git_dir, base, commit_sha)!
+	update_branch_ref_guarding_head(git_dir, base, commit_sha, base_sha, head_ref,
+		expected_head_oid)!
 	return commit_sha
 }
 
@@ -909,10 +955,61 @@ fn git_commit_tree(git_dir string, tree_sha string, parents []string, author str
 	return commit_sha
 }
 
-fn update_branch_ref(git_dir string, branch string, commit_sha string) ! {
-	r := git.Git.exec_in_dir(git_dir, ['update-ref', 'refs/heads/${branch}', commit_sha])
+fn update_git_ref_expected(git_dir string, ref_name string, new_sha string, expected_old_sha string) ! {
+	if !ref_name.starts_with('refs/') || ref_name.contains_any('\x00\r\n ') || new_sha == ''
+		|| expected_old_sha == '' {
+		return error('invalid ref update')
+	}
+	r := git.Git.exec_in_dir(git_dir, ['update-ref', ref_name, new_sha, expected_old_sha])
 	if r.exit_code != 0 {
 		return error('update-ref failed: ${r.output}')
+	}
+}
+
+fn zero_oid_like(oid string) !string {
+	if oid.len !in [40, 64] {
+		return error('invalid object id')
+	}
+	return '0'.repeat(oid.len)
+}
+
+// update_branch_ref_guarding_head verifies the reviewed source ref and the
+// destination base while advancing the base in one Git reference transaction.
+// A push racing between approval gating and publication therefore aborts the
+// whole update instead of changing which commit gets merged.
+fn update_branch_ref_guarding_head(git_dir string, base_branch string, commit_sha string,
+	expected_base_oid string, head string, expected_head_oid string) ! {
+	if !is_safe_ref(base_branch) || !is_safe_ref(head) || !is_full_git_oid(commit_sha)
+		|| !is_full_git_oid(expected_base_oid) || !is_full_git_oid(expected_head_oid) {
+		return error('invalid ref transaction')
+	}
+	base_ref := 'refs/heads/${base_branch}'
+	head_ref := if head.starts_with('refs/') { head } else { 'refs/heads/${head}' }
+	if head_ref == base_ref {
+		return error('merge request head and base refs must differ')
+	}
+	mut input, input_path := util.temp_file(pattern: 'gitly-update-ref-*.stdin')!
+	input.close()
+	defer {
+		os.rm(input_path) or {}
+	}
+	transaction := 'verify ${head_ref} ${expected_head_oid}\n' +
+		'update ${base_ref} ${commit_sha} ${expected_base_oid}\n'
+	os.write_file(input_path, transaction) or {
+		return error('could not write ref transaction: ${err}')
+	}
+
+	mut process := os.new_process('git')
+	process.set_args(['-C', git_dir, 'update-ref', '--stdin'])
+	process.set_redirect_stdio_merged()
+	process.set_stdin_path(input_path)
+	process.run()
+	output := process.stdout_slurp()
+	process.wait()
+	exit_code := process.code
+	process.close()
+	if exit_code != 0 {
+		return error('source or target branch changed during merge: ${output.trim_space()}')
 	}
 }
 

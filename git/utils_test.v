@@ -7,14 +7,34 @@ fn test_get_branch_name_from_reference() {
 }
 
 fn test_split_command_keeps_quoted_arguments() {
-	assert split_command('--no-pager log main --pretty="%h %s"') == ['--no-pager', 'log', 'main',
+	assert split_command('--no-pager log main --pretty="%h %s"')! == ['--no-pager', 'log', 'main',
 		'--pretty=%h %s']
-	assert split_command('archive v1.0 --format=zip --output="/tmp/release archive.zip"') == [
+	assert split_command('archive v1.0 --format=zip --output="/tmp/release archive.zip"')! == [
 		'archive',
 		'v1.0',
 		'--format=zip',
 		'--output=/tmp/release archive.zip',
 	]
+}
+
+fn test_split_command_preserves_empty_arguments_and_literal_backslashes() {
+	assert split_command(r'config key "" C:\repos\project trailing\')! == [
+		'config',
+		'key',
+		'',
+		r'C:\repos\project',
+		r'trailing\',
+	]
+	assert split_command(r"show 'C:\path with spaces\file.txt'")! == [
+		'show',
+		r'C:\path with spaces\file.txt',
+	]
+}
+
+fn test_split_command_rejects_unterminated_quotes() {
+	mut rejected := false
+	split_command('log "unterminated') or { rejected = true }
+	assert rejected
 }
 
 fn test_parse_receive_updates_reads_every_ref() {
@@ -40,10 +60,43 @@ fn test_parse_receive_updates_rejects_truncated_or_invalid_commands() {
 	mut rejected_invalid := false
 	parse_receive_updates(bad) or { rejected_invalid = true }
 	assert rejected_invalid
+
+	old := '1'.repeat(40)
+	new := '2'.repeat(40)
+	mut rejected_missing_flush := false
+	parse_receive_updates(write_packet('${old} ${new} refs/heads/main')) or {
+		rejected_missing_flush = true
+	}
+	assert rejected_missing_flush
+
+	mut rejected_extra_field := false
+	parse_receive_updates(write_packet('${old} ${new} refs/heads/main unexpected') + flush_packet()) or {
+		rejected_extra_field = true
+	}
+	assert rejected_extra_field
 }
 
 fn test_receive_updates_are_only_accepted_after_successful_report_status() {
 	assert receive_updates_accepted('0010unpack ok\n0018ok refs/heads/main\n0000')
 	assert !receive_updates_accepted('0010unpack ok\n0028ng refs/heads/main hook declined\n0000')
+	assert !receive_updates_accepted('0010unpack ok\n0000')
+	assert !receive_updates_accepted('fatal: text happened to mention unpack ok')
 	assert !receive_updates_accepted('')
+}
+
+fn test_git_ref_delete_requires_a_full_object_id() {
+	assert GitRefUpdate{
+		new_hash: '0'.repeat(40)
+	}.is_delete()
+	assert GitRefUpdate{
+		new_hash: '0'.repeat(64)
+	}.is_delete()
+	assert !GitRefUpdate{
+		new_hash: '000'
+	}.is_delete()
+}
+
+fn test_git_info_refs_url_preserves_git_suffix() {
+	assert git_info_refs_url('https://example.com/owner/repo.git') == 'https://example.com/owner/repo.git/info/refs?service=git-upload-pack'
+	assert git_info_refs_url('https://example.com/owner/repo/') == 'https://example.com/owner/repo/info/refs?service=git-upload-pack'
 }

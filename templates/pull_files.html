@@ -35,7 +35,7 @@
 			@if file_diffs.len == 0
 				<div class="issues-empty">%pr_no_file_changes</div>
 			@else
-				@if ctx.logged_in
+				@if ctx.logged_in && pr.is_open()
 					<form method='post' class='pr-review-form' action='/@repo.user_name/@repo.name/pull/@pr.id/review'>
 				@end
 
@@ -45,7 +45,7 @@
 						<span class="pr-files-toolbar__add">+@all_adds</span>
 						<span class="pr-files-toolbar__del">-@all_dels</span>
 					</div>
-					@if ctx.logged_in
+					@if ctx.logged_in && pr.is_open()
 						<button type='submit' class='pr-action pr-action--review pr-files-toolbar__submit'>%pr_submit_review</button>
 					@end
 				</div>
@@ -78,7 +78,7 @@
 					</section>
 				</div>
 
-				@if ctx.logged_in
+				@if ctx.logged_in && pr.is_open()
 						<div class='pr-review-submit'>
 							<textarea name='body' placeholder='%pr_overall_review_placeholder' rows='3'></textarea>
 							<div class='pr-review-actions'>

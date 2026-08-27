@@ -7,16 +7,16 @@
 	<body>
 		@include 'layout/header.html'
 
-		<script>
-			const TREE_BRANCH_PATH_TEMPLATE = "/@repo.user_name/@repo.name/tree/";
-			const BRANCH_NAME = "@branch_name";
-			const REPO_ID = @repo.id;
-			const CURRENT_PATH = "@ctx.current_path";
-			const REPO_USER = "@repo.user_name";
-			const REPO_NAME = "@repo.name";
-			const TREE_MODE = "@tree_mode";
-			const TREE_FOLDER_SIZE_ENABLED = "@{show_folder_size}" === "true";
-		</script>
+		<div id="tree-context"
+			data-tree-base="/@repo.user_name/@repo.name/tree/"
+			data-branch="@branch_name"
+			data-repo-id="@repo.id"
+			data-current-path="@ctx.current_path"
+			data-repo-user="@repo.user_name"
+			data-repo-name="@repo.name"
+			data-tree-mode="@tree_mode"
+			data-folder-size-enabled="@show_folder_size"
+			hidden></div>
 
 		<div class="content">
 			<div class="repo-header-area">
@@ -75,8 +75,17 @@
 			@end
 				<span class="branch-specific-container">
 					<select class="branch-select" name="branch">
-						@for name in app.get_all_repo_branch_names(repo.id)
-							<option value="@name">@name</option>
+						<optgroup label="Branches">
+							@for name in app.get_all_repo_branch_names(repo.id)
+								<option value="@name">@name</option>
+							@end
+						</optgroup>
+						@if app.get_all_repo_tags(repo.id).len > 0
+							<optgroup label="Tags">
+								@for tag in app.get_all_repo_tags(repo.id)
+									<option value="refs/tags/@tag.name">@tag.name</option>
+								@end
+							</optgroup>
 						@end
 					</select>
 
@@ -97,7 +106,7 @@
 
 					<div class="branch-right-actions">
 						@if ctx.logged_in && app.user_can_push_branch(ctx.user.id, repo, branch_name)
-							<a class="add-file-btn" href="/@repo.user_name/@repo.name/new/@branch_name">+</a>
+							<a class="add-file-btn" href="/@repo.user_name/@repo.name/new/@branch_url">+</a>
 						@end
 
 						<div class="repo-code-container">
@@ -164,7 +173,7 @@
 								<svg aria-hidden="true" focusable="false" data-prefix="far" data-icon="file-alt" role="img" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 384 512"><path fill="currentColor" d="M288 248v28c0 6.6-5.4 12-12 12H108c-6.6 0-12-5.4-12-12v-28c0-6.6 5.4-12 12-12h168c6.6 0 12 5.4 12 12zm-12 72H108c-6.6 0-12 5.4-12 12v28c0 6.6 5.4 12 12 12h168c6.6 0 12-5.4 12-12v-28c0-6.6-5.4-12-12-12zm108-188.1V464c0 26.5-21.5 48-48 48H48c-26.5 0-48-21.5-48-48V48C0 21.5 21.5 0 48 0h204.1C264.8 0 277 5.1 286 14.1L369.9 98c9 8.9 14.1 21.2 14.1 33.9zm-128-80V128h76.1L256 51.9zM336 464V176H232c-13.3 0-24-10.7-24-24V48H48v416h288z"></path></svg>
 							}
 							span.file-name {
-								<a href='/@repo.user_name/@repo.name/blob/@branch_name/@file.full_path()'>@file.full_path()</a>
+								<a href='/@repo.user_name/@repo.name/@file.url()'>@file.full_path()</a>
 							}
 							<span class="file-size">
 								@file.pretty_size()

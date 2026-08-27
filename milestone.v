@@ -28,17 +28,9 @@ fn (m &Milestone) due_date_str() string {
 }
 
 fn (mut app App) add_milestone(repo_id int, title string, description string, due_date int) !int {
-	m := Milestone{
-		repo_id:     repo_id
-		title:       title
-		description: description
-		due_date:    due_date
-		created_at:  int(time.now().unix())
-	}
-	sql app.db {
-		insert m into Milestone
-	}!
-	return db_last_insert_id(mut app.db)
+	return db_insert_returning_id(mut app.db, 'Milestone', ['repo_id', 'title', 'description',
+		'due_date', 'is_closed', 'created_at'], [repo_id.str(), title, description, due_date.str(),
+		db_bool_value(false), int(time.now().unix()).str()])
 }
 
 fn (mut app App) list_repo_milestones(repo_id int) []Milestone {

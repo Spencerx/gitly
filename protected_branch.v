@@ -78,13 +78,19 @@ struct ProtectedBranch {
 
 fn valid_protected_branch_pattern(pattern string) bool {
 	value := pattern.trim_space()
-	if value == '' || value.len > 255 || value.starts_with('-')
-		|| value.contains_any('\x00\r\n;|?[]\\') || value.contains(' ') || value.contains('..')
+	if value == '' || value == '@' || value.len > 255 || value.starts_with('-')
+		|| value.contains_any(';|?[]\\~^:') || value.contains(' ') || value.contains('..')
 		|| value.contains('@{') {
 		return false
 	}
+	for ch in value.bytes() {
+		if ch < 0x20 || ch == 0x7f {
+			return false
+		}
+	}
 	for segment in value.split('/') {
-		if segment == '' || segment == '.' || segment.ends_with('.') || segment.ends_with('.lock') {
+		if segment == '' || segment.starts_with('.') || segment.ends_with('.')
+			|| segment.ends_with('.lock') {
 			return false
 		}
 	}
@@ -163,7 +169,9 @@ fn (app &App) ensure_protected_branch_hook(repo Repo) ! {
 		os.write_file(post_hook_path, gitly_post_receive_hook)!
 	}
 	os.chmod(post_hook_path, 0o700)!
-	config_result := git.Git.exec_in_dir(repo.git_dir, ['config', 'core.hooksPath', hook_dir])
+	// Keep this relative to the bare repository so repository transfers do not
+	// leave Git pointing at a hook directory under the old namespace.
+	config_result := git.Git.exec_in_dir(repo.git_dir, ['config', 'core.hooksPath', '.gitly-hooks'])
 	if config_result.exit_code != 0 {
 		return error('could not configure protected branch hook')
 	}
@@ -206,22 +214,15 @@ fn (app &App) user_can_merge_branch(user_id int, repo Repo, branch string) bool 
 	return required < project_access_no_one && level >= required
 }
 
-fn (mut app App) protect_branch(repo_id int, pattern string, push_access int, merge_access int) ! {
+fn (mut app App) protect_branch(repo_id int, pattern string, push_access int, merge_access int) !int {
 	clean_pattern := pattern.trim_space()
 	if repo_id <= 0 || !valid_protected_branch_pattern(clean_pattern)
 		|| !valid_branch_access_level(push_access) || !valid_branch_access_level(merge_access) {
 		return error('invalid protected branch rule')
 	}
-	rule := ProtectedBranch{
-		repo_id:      repo_id
-		pattern:      clean_pattern
-		push_access:  push_access
-		merge_access: merge_access
-		created_at:   int(time.now().unix())
-	}
-	sql app.db {
-		insert rule into ProtectedBranch
-	}!
+	return db_insert_returning_id(mut app.db, 'ProtectedBranch', ['repo_id', 'pattern', 'push_access',
+		'merge_access', 'created_at'], [repo_id.str(), clean_pattern, push_access.str(),
+		merge_access.str(), int(time.now().unix()).str()])
 }
 
 fn (mut app App) update_protected_branch(repo_id int, rule_id int, push_access int, merge_access int) ! {

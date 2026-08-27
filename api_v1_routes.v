@@ -3,6 +3,7 @@
 module main
 
 import veb
+import api
 
 struct ApiRepoView {
 	id                 int
@@ -31,6 +32,7 @@ struct ApiIssueView {
 	body           string
 	author         string
 	status         string
+	assignees      []string
 	comments_count int
 	created_at     int
 }
@@ -81,6 +83,10 @@ struct ApiApprovalStatusView {
 	approved_by []ApiApprovalView
 }
 
+struct ApiApprovalRuleView {
+	required_approvals int
+}
+
 struct ApiUserView {
 	id        int
 	username  string
@@ -124,6 +130,7 @@ fn (mut app App) repo_to_api(repo Repo) ApiRepoView {
 fn (mut app App) issue_to_api(issue Issue) ApiIssueView {
 	author := app.get_username_by_id(issue.author_id) or { '' }
 	status := if issue.status == .closed { 'closed' } else { 'open' }
+	assignees := app.find_issue_assignees(issue).map(it.username)
 	return ApiIssueView{
 		id:             issue.id
 		number:         issue.id
@@ -132,6 +139,7 @@ fn (mut app App) issue_to_api(issue Issue) ApiIssueView {
 		body:           issue.text
 		author:         author
 		status:         status
+		assignees:      assignees
 		comments_count: issue.comments_count
 		created_at:     issue.created_at
 	}
@@ -183,22 +191,38 @@ fn (mut app App) api_user_from_ctx(ctx &Context) ?User {
 		}
 		return none
 	}
-	return app.user_for_api_token(token)
+	// Browser sessions retain their normal permissions. Bearer tokens must have
+	// a read scope for safe methods and the full API scope for state changes.
+	required_scope := if ctx.req.method in [.get, .head] {
+		api_token_scope_read_api
+	} else {
+		api_token_scope_api
+	}
+	return app.user_for_api_token(token, required_scope)
 }
 
 fn (mut ctx Context) api_unauthorized() veb.Result {
-	ctx.send_custom_error(401, 'Unauthorized')
-	return ctx.json({
-		'success': 'false'
-		'message': 'authentication required'
-	})
+	return ctx.api_error_response(401, 'Unauthorized', 'authentication required')
 }
 
 fn (mut ctx Context) api_not_found() veb.Result {
-	ctx.send_custom_error(404, 'Not Found')
-	return ctx.json({
-		'success': 'false'
-		'message': 'not found'
+	return ctx.api_error_response(404, 'Not Found', 'not found')
+}
+
+fn (mut ctx Context) api_error_response(code int, status_text string, message string) veb.Result {
+	// send_custom_error finalizes a plain-text response immediately, so setting
+	// the response status directly is required before writing the JSON body.
+	ctx.res.status_code = code
+	ctx.res.status_msg = status_text
+	return ctx.json(api.ApiErrorResponse{
+		success: false
+		message: message
+	})
+}
+
+fn (mut ctx Context) api_success_response() veb.Result {
+	return ctx.json(api.ApiResponse{
+		success: true
 	})
 }
 
@@ -227,9 +251,13 @@ pub fn (mut app App) api_v1_user(mut ctx Context, username string) veb.Result {
 @['/api/v1/users/:username/repos']
 pub fn (mut app App) api_v1_user_repos(mut ctx Context, username string) veb.Result {
 	user := app.get_user_by_username(username) or { return ctx.api_not_found() }
-	repos := app.find_user_public_repos(user.id)
+	caller := app.api_user_from_ctx(ctx) or { User{} }
+	repos := app.find_user_repos(user.id)
 	mut out := []ApiRepoView{cap: repos.len}
 	for r in repos {
+		if !app.user_has_repo_read_access(caller.id, r) {
+			continue
+		}
 		out << app.repo_to_api(r)
 	}
 	return ctx.json(out)
@@ -274,7 +302,7 @@ pub fn (mut app App) api_v1_repo_issue(mut ctx Context, username string, repo_na
 		return ctx.api_not_found()
 	}
 	issue := app.find_issue_by_id(id.int()) or { return ctx.api_not_found() }
-	if issue.repo_id != repo.id {
+	if issue.repo_id != repo.id || issue.is_pr {
 		return ctx.api_not_found()
 	}
 	return ctx.json(app.issue_to_api(issue))
@@ -292,21 +320,121 @@ pub fn (mut app App) api_v1_create_issue(mut ctx Context, username string, repo_
 	title := ctx.form['title']
 	body := ctx.form['body']
 	if !valid_title(title) || !valid_body(body) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'title is required and content must be within size limits'
-		})
+		return ctx.api_error_response(400, 'Bad Request',
+			'title is required and content must be within size limits')
 	}
 	new_id := app.add_issue_returning_id(repo.id, user.id, title, body) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to create issue'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to create issue')
+	}
+	app.sync_repo_open_issue_count(repo.id) or { app.info(err.str()) }
+	app.dispatch_webhook(repo.id, 'issue', WebhookIssuePayload{
+		action: 'opened'
+		repo:   '${username}/${repo_name}'
+		title:  title
+		author: user.username
+	})
+	if !app.has_activity(user.id, 'first_issue') {
+		app.add_activity(user.id, 'first_issue') or { app.info(err.str()) }
 	}
 	issue := app.find_issue_by_id(new_id) or { return ctx.api_not_found() }
 	return ctx.json(app.issue_to_api(issue))
+}
+
+@['/api/v1/repos/:username/:repo_name/issues/:id/comments']
+pub fn (mut app App) api_v1_issue_comments(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	repo := app.find_repo_by_name_and_username(repo_name, username) or {
+		return ctx.api_not_found()
+	}
+	caller := app.api_user_from_ctx(ctx) or { User{} }
+	if !app.user_has_repo_read_access(caller.id, repo) {
+		return ctx.api_not_found()
+	}
+	issue := app.find_issue_by_id(id.int()) or { return ctx.api_not_found() }
+	if issue.repo_id != repo.id || issue.is_pr {
+		return ctx.api_not_found()
+	}
+	comments := app.get_all_issue_comments(issue.id)
+	mut out := []ApiCommentView{cap: comments.len}
+	for comment in comments {
+		out << ApiCommentView{
+			id:         comment.id
+			author:     app.get_username_by_id(comment.author_id) or { '' }
+			text:       comment.text
+			created_at: comment.created_at
+		}
+	}
+	return ctx.json(out)
+}
+
+@['/api/v1/repos/:username/:repo_name/issues/:id/comments'; post]
+pub fn (mut app App) api_v1_create_issue_comment(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	user := app.api_user_from_ctx(ctx) or { return ctx.api_unauthorized() }
+	repo := app.find_repo_by_name_and_username(repo_name, username) or {
+		return ctx.api_not_found()
+	}
+	if !app.user_has_repo_read_access(user.id, repo) {
+		return ctx.api_not_found()
+	}
+	issue := app.find_issue_by_id(id.int()) or { return ctx.api_not_found() }
+	if issue.repo_id != repo.id || issue.is_pr {
+		return ctx.api_not_found()
+	}
+	text := ctx.form['text']
+	if !valid_comment(text) {
+		return ctx.api_error_response(400, 'Bad Request',
+			'text is required and must be within size limits')
+	}
+	app.add_issue_comment(user.id, issue.id, text) or {
+		return ctx.transport_api_error(500, 'Could not add issue comment')
+	}
+	app.increment_issue_comments(issue.id) or { app.info(err.str()) }
+	app.dispatch_webhook(repo.id, 'comment', WebhookCommentPayload{
+		action: 'created'
+		repo:   '${username}/${repo_name}'
+		target: 'issue'
+		number: issue.id
+		author: user.username
+		text:   text
+	})
+	return ctx.api_success_response()
+}
+
+@['/api/v1/repos/:username/:repo_name/issues/:id/close'; post]
+pub fn (mut app App) api_v1_close_issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	return api_v1_change_issue_status(mut app, mut ctx, username, repo_name, id, .closed)
+}
+
+@['/api/v1/repos/:username/:repo_name/issues/:id/reopen'; post]
+pub fn (mut app App) api_v1_reopen_issue(mut ctx Context, username string, repo_name string, id string) veb.Result {
+	return api_v1_change_issue_status(mut app, mut ctx, username, repo_name, id, .open)
+}
+
+fn api_v1_change_issue_status(mut app App, mut ctx Context, username string, repo_name string, id string, status IssueStatus) veb.Result {
+	user := app.api_user_from_ctx(ctx) or { return ctx.api_unauthorized() }
+	repo := app.find_repo_by_name_and_username(repo_name, username) or {
+		return ctx.api_not_found()
+	}
+	issue := app.find_issue_by_id(id.int()) or { return ctx.api_not_found() }
+	if issue.repo_id != repo.id || issue.is_pr || !app.user_has_repo_read_access(user.id, repo) {
+		return ctx.api_not_found()
+	}
+	if issue.author_id != user.id && !app.user_can_write_repo(user.id, repo) {
+		return ctx.api_error_response(403, 'Forbidden',
+			'Issue author or Developer access is required')
+	}
+	app.set_issue_status(issue.id, status) or {
+		return ctx.transport_api_error(500, 'Could not update issue status')
+	}
+	app.sync_repo_open_issue_count(repo.id) or { app.info(err.str()) }
+	action := if status == .closed { 'closed' } else { 'reopened' }
+	app.dispatch_webhook(repo.id, 'issue', WebhookIssuePayload{
+		action: action
+		repo:   '${username}/${repo_name}'
+		title:  issue.title
+		author: user.username
+	})
+	updated := app.find_issue_by_id(issue.id) or { return ctx.api_not_found() }
+	return ctx.json(app.issue_to_api(updated))
 }
 
 @['/api/v1/repos/:username/:repo_name/pulls']
@@ -554,19 +682,12 @@ pub fn (mut app App) api_v1_create_discussion(mut ctx Context, username string, 
 	body := ctx.form['body']
 	raw_cat := ctx.form['category']
 	if !valid_title(title) || !valid_body(body) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'title is required and content must be within size limits'
-		})
+		return ctx.api_error_response(400, 'Bad Request',
+			'title is required and content must be within size limits')
 	}
 	cat := if raw_cat in ['general', 'qa', 'announcement', 'idea'] { raw_cat } else { 'general' }
 	new_id := app.add_discussion(repo.id, user.id, title, body, cat) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to create discussion'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to create discussion')
 	}
 	discussion := app.find_discussion(new_id) or { return ctx.api_not_found() }
 	return ctx.json(app.discussion_to_api(discussion))
@@ -619,30 +740,17 @@ pub fn (mut app App) api_v1_create_discussion_comment(mut ctx Context, username 
 		return ctx.api_not_found()
 	}
 	if discussion.is_locked {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'discussion is locked'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'discussion is locked')
 	}
 	text := ctx.form['text']
 	if !valid_comment(text) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'text is required and must be within size limits'
-		})
+		return ctx.api_error_response(400, 'Bad Request',
+			'text is required and must be within size limits')
 	}
 	app.add_discussion_comment(discussion.id, user.id, text) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to add comment'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to add comment')
 	}
-	return ctx.json({
-		'success': 'true'
-	})
+	return ctx.api_success_response()
 }
 
 @['/api/v1/repos/:username/:repo_name/milestones']
@@ -694,28 +802,18 @@ pub fn (mut app App) api_v1_create_milestone(mut ctx Context, username string, r
 		return ctx.api_not_found()
 	}
 	if !app.user_can_write_repo(user.id, repo) {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Developer access is required to create milestones'
-		})
+		return ctx.api_error_response(403, 'Forbidden',
+			'Developer access is required to create milestones')
 	}
 	title := ctx.form['title']
 	desc := ctx.form['description']
 	due := parse_yyyy_mm_dd(ctx.form['due_date'])
 	if !valid_title(title) || !valid_body(desc) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'title is required and content must be within size limits'
-		})
+		return ctx.api_error_response(400, 'Bad Request',
+			'title is required and content must be within size limits')
 	}
 	new_id := app.add_milestone(repo.id, title, desc, due) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to create milestone'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to create milestone')
 	}
 	milestone := app.find_milestone(new_id) or { return ctx.api_not_found() }
 	return ctx.json(app.milestone_to_api(milestone))
@@ -789,27 +887,17 @@ pub fn (mut app App) api_v1_create_project(mut ctx Context, username string, rep
 		return ctx.api_not_found()
 	}
 	if !app.user_can_write_repo(user.id, repo) {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Developer access is required to create projects'
-		})
+		return ctx.api_error_response(403, 'Forbidden',
+			'Developer access is required to create projects')
 	}
 	name := ctx.form['name']
 	desc := ctx.form['description']
 	if !valid_short_name(name) || !valid_body(desc) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'name is required and content must be within size limits'
-		})
+		return ctx.api_error_response(400, 'Bad Request',
+			'name is required and content must be within size limits')
 	}
 	new_id := app.add_project(repo.id, name, desc) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to create project'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to create project')
 	}
 	project := app.find_project(new_id) or { return ctx.api_not_found() }
 	return ctx.json(app.project_to_api(project))
@@ -855,30 +943,21 @@ pub fn (mut app App) api_v1_create_webhook(mut ctx Context, username string, rep
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required to create webhooks'
-		})
+		return ctx.api_error_response(403, 'Forbidden',
+			'Maintainer access is required to create webhooks')
 	}
 	url := ctx.form['url'].trim_space()
 	secret := ctx.form['secret']
 	events := ctx.form['events'].trim_space()
 	if url == '' || url.len > max_clone_url_len || secret.len > max_webhook_secret_len
 		|| !is_safe_webhook_url(url) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'valid http(s) url is required'
-		})
+		return ctx.api_error_response(400, 'Bad Request', 'valid http(s) url is required')
 	}
-	events_str := if events == '' { 'push,issue,pr,comment,release' } else { events }
+	events_str := normalize_webhook_events(events) or {
+		return ctx.api_error_response(400, 'Bad Request', err.str())
+	}
 	app.add_webhook(repo.id, url, secret, events_str) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to create webhook'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to create webhook')
 	}
 	hooks := app.list_repo_webhooks(repo.id)
 	if hooks.len == 0 {
@@ -917,39 +996,24 @@ pub fn (mut app App) api_v1_add_repo_member(mut ctx Context, username string, re
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	target := app.get_user_by_username(ctx.form['username'].trim_space().to_lower()) or {
 		return ctx.api_not_found()
 	}
 	role := ctx.form['role'].trim_space().to_lower()
 	if !target.is_registered || target.is_blocked || !valid_project_member_role(role) {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'invalid member or role'
-		})
+		return ctx.api_error_response(400, 'Bad Request', 'invalid member or role')
 	}
 	if app.repo_access_level(target.id, repo) >= project_access_owner {
-		ctx.send_custom_error(409, 'Conflict')
-		return ctx.json({
-			'success': 'false'
-			'message': 'the repository owner already has full access'
-		})
+		return ctx.api_error_response(409, 'Conflict',
+			'the repository owner already has full access')
 	}
-	app.add_project_member(repo.id, target.id, role) or {
-		ctx.send_custom_error(409, 'Conflict')
-		return ctx.json({
-			'success': 'false'
-			'message': 'the user is already a direct member'
-		})
+	member_id := app.add_project_member(repo.id, target.id, role) or {
+		return ctx.api_error_response(409, 'Conflict', 'the user is already a direct member')
 	}
 	return ctx.json(ApiProjectMemberView{
-		id:           db_last_insert_id(mut app.db)
+		id:           member_id
 		user_id:      target.id
 		username:     target.username
 		role:         role
@@ -964,20 +1028,12 @@ pub fn (mut app App) api_v1_update_repo_member(mut ctx Context, username string,
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	member := app.find_project_member_by_id(repo.id, id.int()) or { return ctx.api_not_found() }
 	role := ctx.form['role'].trim_space().to_lower()
 	app.update_project_member_role(repo.id, member.id, role) or {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'invalid member role'
-		})
+		return ctx.api_error_response(400, 'Bad Request', 'invalid member role')
 	}
 	target := app.get_user_by_id(member.user_id) or { return ctx.api_not_found() }
 	return ctx.json(ApiProjectMemberView{
@@ -996,23 +1052,13 @@ pub fn (mut app App) api_v1_delete_repo_member(mut ctx Context, username string,
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	member := app.find_project_member_by_id(repo.id, id.int()) or { return ctx.api_not_found() }
 	app.remove_project_member(repo.id, member.id) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to remove member'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to remove member')
 	}
-	return ctx.json({
-		'success': 'true'
-	})
+	return ctx.api_success_response()
 }
 
 @['/api/v1/repos/:username/:repo_name/protected-branches']
@@ -1044,24 +1090,17 @@ pub fn (mut app App) api_v1_protect_branch(mut ctx Context, username string, rep
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	pattern := ctx.form['pattern'].trim_space()
 	push_access := ctx.form['push_access'].int()
 	merge_access := ctx.form['merge_access'].int()
-	app.protect_branch(repo.id, pattern, push_access, merge_access) or {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'invalid or duplicate protected branch rule'
-		})
+	rule_id := app.protect_branch(repo.id, pattern, push_access, merge_access) or {
+		return ctx.api_error_response(400, 'Bad Request',
+			'invalid or duplicate protected branch rule')
 	}
 	return ctx.json(ApiProtectedBranchView{
-		id:           db_last_insert_id(mut app.db)
+		id:           rule_id
 		pattern:      pattern
 		push_access:  push_access
 		merge_access: merge_access
@@ -1075,21 +1114,13 @@ pub fn (mut app App) api_v1_update_protected_branch(mut ctx Context, username st
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	rule := app.find_protected_branch_by_id(repo.id, id.int()) or { return ctx.api_not_found() }
 	push_access := ctx.form['push_access'].int()
 	merge_access := ctx.form['merge_access'].int()
 	app.update_protected_branch(repo.id, rule.id, push_access, merge_access) or {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'invalid protected branch access level'
-		})
+		return ctx.api_error_response(400, 'Bad Request', 'invalid protected branch access level')
 	}
 	return ctx.json(ApiProtectedBranchView{
 		id:           rule.id
@@ -1106,23 +1137,14 @@ pub fn (mut app App) api_v1_delete_protected_branch(mut ctx Context, username st
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	rule := app.find_protected_branch_by_id(repo.id, id.int()) or { return ctx.api_not_found() }
 	app.unprotect_branch(repo.id, rule.id) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to remove protected branch rule'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error',
+			'failed to remove protected branch rule')
 	}
-	return ctx.json({
-		'success': 'true'
-	})
+	return ctx.api_success_response()
 }
 
 @['/api/v1/repos/:username/:repo_name/approval-rule'; post]
@@ -1132,22 +1154,15 @@ pub fn (mut app App) api_v1_update_approval_rule(mut ctx Context, username strin
 		return ctx.api_not_found()
 	}
 	if app.repo_access_level(user.id, repo) < project_access_maintainer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'Maintainer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'Maintainer access is required')
 	}
 	required := ctx.form['required'].int()
 	app.set_repo_required_approvals(repo.id, required) or {
-		ctx.send_custom_error(400, 'Bad Request')
-		return ctx.json({
-			'success': 'false'
-			'message': 'required approvals must be between 0 and 100'
-		})
+		return ctx.api_error_response(400, 'Bad Request',
+			'required approvals must be between 0 and 100')
 	}
-	return ctx.json({
-		'required_approvals': required.str()
+	return ctx.json(ApiApprovalRuleView{
+		required_approvals: required
 	})
 }
 
@@ -1190,18 +1205,11 @@ pub fn (mut app App) api_v1_approve_pull(mut ctx Context, username string, repo_
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.api_not_found() }
 	if pr.repo_id != repo.id || !pr.is_open() || pr.author_id == user.id
 		|| app.repo_access_level(user.id, repo) < project_access_developer {
-		ctx.send_custom_error(403, 'Forbidden')
-		return ctx.json({
-			'success': 'false'
-			'message': 'eligible Developer access is required'
-		})
+		return ctx.api_error_response(403, 'Forbidden', 'eligible Developer access is required')
 	}
 	app.approve_pull_request(pr.id, user.id) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to approve merge request'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error',
+			'failed to approve merge request')
 	}
 	return app.api_v1_pull_approvals(mut ctx, username, repo_name, id)
 }
@@ -1216,15 +1224,11 @@ pub fn (mut app App) api_v1_revoke_pull_approval(mut ctx Context, username strin
 		return ctx.api_not_found()
 	}
 	pr := app.find_pull_request_by_id(id.int()) or { return ctx.api_not_found() }
-	if pr.repo_id != repo.id {
+	if pr.repo_id != repo.id || !pr.is_open() {
 		return ctx.api_not_found()
 	}
 	app.revoke_pull_request_approval(pr.id, user.id) or {
-		ctx.send_custom_error(500, 'Internal Server Error')
-		return ctx.json({
-			'success': 'false'
-			'message': 'failed to revoke approval'
-		})
+		return ctx.api_error_response(500, 'Internal Server Error', 'failed to revoke approval')
 	}
 	return app.api_v1_pull_approvals(mut ctx, username, repo_name, id)
 }

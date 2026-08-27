@@ -5,8 +5,9 @@ import os
 import git
 import rand
 
-// GET /:username/:repo_name/new/:branch_name - Show create file form
-@['/:username/:repo_name/new/:branch_name']
+// GET /:username/:repo_name/new/:branch_name... - Show create file form.
+// The catch-all is required because branch names may contain `/`.
+@['/:username/:repo_name/new/:branch_name...']
 pub fn (mut app App) new_file(username string, repo_name string, branch_name string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
 
@@ -42,13 +43,21 @@ pub fn (mut app App) new_ci_file(username string, repo_name string) veb.Result {
 	return $veb.html('templates/new_file.html')
 }
 
-// GET /:username/:repo_name/edit/:branch_name/:path... - Show edit file form
-@['/:username/:repo_name/edit/:branch_name/:path...']
-pub fn (mut app App) edit_file(username string, repo_name string, branch_name string, path string) veb.Result {
+// GET /:username/:repo_name/edit/:location... - Show edit file form
+@['/:username/:repo_name/edit/:location...']
+pub fn (mut app App) edit_file(username string, repo_name string, location string) veb.Result {
 	repo := app.find_repo_by_name_and_username(repo_name, username) or { return ctx.not_found() }
+	if !ctx.logged_in || !app.user_can_write_repo(ctx.user.id, repo) {
+		return ctx.redirect_to_repository(username, repo_name)
+	}
+	resolved := resolve_repo_ref_path(repo, location, true) or {
+		return ctx.redirect_to_repository(username, repo_name)
+	}
+	branch_name := resolved.ref_name
+	path := resolved.path
 
-	if !ctx.logged_in || !app.user_can_push_branch(ctx.user.id, repo, branch_name)
-		|| !is_safe_ref(branch_name) || !is_valid_repo_file_path(path) {
+	if !app.user_can_push_branch(ctx.user.id, repo, branch_name) || !is_safe_ref(branch_name)
+		|| !is_valid_repo_file_path(path) {
 		return ctx.redirect_to_repository(username, repo_name)
 	}
 
@@ -109,12 +118,12 @@ pub fn (mut app App) handle_update_file(username string, repo_name string) veb.R
 
 	// Trigger CI if applicable
 	if file_path == '.gitly-ci.yml' {
-		spawn app.trigger_ci_with_config(repo.id, actual_branch, file_content)
+		spawn run_ci_trigger_with_config(repo.id, actual_branch, file_content, app.config)
 	} else {
-		spawn app.trigger_ci_if_configured(repo.id, actual_branch)
+		spawn run_ci_trigger_if_configured(repo.id, actual_branch, app.config)
 	}
 
-	return ctx.redirect('/${username}/${repo_name}/blob/${actual_branch}/${file_path}')
+	return ctx.redirect('/${username}/${repo_name}/blob/${repo_url_path(actual_branch)}/${repo_url_path(file_path)}')
 }
 
 // POST /:username/:repo_name/create-file - Create a file in the repo
@@ -180,9 +189,9 @@ pub fn (mut app App) handle_create_file(username string, repo_name string) veb.R
 
 	// Trigger CI — if we just created .gitly-ci.yml, pass the content directly
 	if file_path == '.gitly-ci.yml' {
-		spawn app.trigger_ci_with_config(repo.id, actual_branch, file_content)
+		spawn run_ci_trigger_with_config(repo.id, actual_branch, file_content, app.config)
 	} else {
-		spawn app.trigger_ci_if_configured(repo.id, actual_branch)
+		spawn run_ci_trigger_if_configured(repo.id, actual_branch, app.config)
 	}
 
 	return ctx.redirect('/${username}/${repo_name}')
@@ -305,7 +314,10 @@ fn (mut app App) create_file_in_bare_repo(mut repo Repo, branch string, file_pat
 	if parent_commit != '' {
 		update_args << parent_commit
 	} else {
-		update_args << '0000000000000000000000000000000000000000'
+		update_args << (zero_oid_like(new_commit_hash) or {
+			app.warn('commit-tree produced an invalid object id')
+			return false
+		})
 	}
 	r5 := git.Git.exec_in_dir(git_dir, update_args)
 	if r5.exit_code != 0 {

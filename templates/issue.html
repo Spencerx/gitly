@@ -15,6 +15,11 @@
 
 			<div class="issue-header">
 				<h1 class="issue-header__title">@{issue.formatted_title()} <span class="issue-header__id">#@issue.id</span></h1>
+				@if issue.is_open()
+					<span class="pr-status-badge pr-status--open">Open</span>
+				@else
+					<span class="pr-status-badge pr-status--closed">Closed</span>
+				@end
 			</div>
 
 			<div class="issue-post">
@@ -29,6 +34,44 @@
 					<div class="markdown-body issue-post__content">@{issue.formatted_body()}</div>
 				</div>
 			</div>
+
+			<section class="issue-assignees" aria-labelledby="issue-assignees-heading">
+				<div class="issue-assignees__header">
+					<h2 id="issue-assignees-heading">Assignees</h2>
+					@if assignees.len == 0
+						<span>None</span>
+					@end
+				</div>
+				@if assignees.len > 0
+					<div class="issue-assignees__list">
+						@for assignee in assignees
+							<div class="issue-assignee">
+								<a href="/@assignee.username" class="issue-assignee__user">
+									<img src="@{app.prepare_user_avatar_url(assignee.avatar)}" alt="">
+									<span>@assignee.username</span>
+								</a>
+								@if can_manage_assignees
+									<form method="post" action="/@repo.user_name/@repo.name/issue/@issue.id/unassign">
+										<input type="hidden" name="assignee_id" value="@assignee.id">
+										<button type="submit" class="issue-assignee__remove" aria-label="Unassign @assignee.username">Unassign</button>
+									</form>
+								@end
+							</div>
+						@end
+					</div>
+				@end
+				@if can_manage_assignees && assignable_users.len > 0
+					<form method="post" action="/@repo.user_name/@repo.name/issue/@issue.id/assign" class="issue-assignees__form">
+						<label for="assignee_id">Assign a project member</label>
+						<select id="assignee_id" name="assignee_id" required>
+							@for candidate in assignable_users
+								<option value="@candidate.id">@candidate.username</option>
+							@end
+						</select>
+						<button type="submit">Assign</button>
+					</form>
+				@end
+			</section>
 
 			@for comment_with_user in comments_with_users
 				<div class="issue-post issue-post--comment">
@@ -53,6 +96,20 @@
 						<input type='submit' class="comment-form__submit" name='submit' value='%pr_comment_button'>
 					</div>
 				</form>
+			@end
+
+			@if can_manage
+				<div class="pr-actions">
+					@if issue.is_open()
+						<form method="post" action="/@repo.user_name/@repo.name/issue/@issue.id/close" class="pr-action-form">
+							<button type="submit" class="pr-action pr-action--close">Close issue</button>
+						</form>
+					@else
+						<form method="post" action="/@repo.user_name/@repo.name/issue/@issue.id/reopen" class="pr-action-form">
+							<button type="submit" class="pr-action">Reopen issue</button>
+						</form>
+					@end
+				</div>
 			@end
 		</div>
 

@@ -168,10 +168,12 @@ fn compile_gitly(binary string) ! {
 	ilog('Compile gitly')
 	mut process := os.new_process(@VEXE)
 	process.set_args(['-d', 'sqlite', '-d', 'use_openssl', '-o', binary, '.'])
-	process.set_redirect_stdio()
+	process.set_redirect_stdio_merged()
 	process.run()
+	// Drain compiler output while it is running. Waiting first can deadlock when
+	// a failed build emits more diagnostics than the pipe buffer can hold.
+	output := process.stdout_slurp()
 	process.wait()
-	output := process.stdout_slurp() + process.stderr_slurp()
 	exit_code := process.code
 	process.close()
 	if exit_code != 0 {

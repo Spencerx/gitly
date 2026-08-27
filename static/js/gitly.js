@@ -2,7 +2,6 @@ function post(url, dataObj, success) {
 	// Create a FormData object
 	const formData = new FormData();
 
-	console.log(dataObj);
 	if (dataObj !== undefined) {
 		// Populate the FormData object with the object entries
 		Object.entries(dataObj).forEach(([key, value]) => {
@@ -38,10 +37,13 @@ function post(url, dataObj, success) {
 
 
 function change_lang(x) {
-	var y = document.getElementById("select_lang");
-	post('/change_lang/' + y.value, {}, () => {
+	const select = document.getElementById("select_lang");
+	if (!select) {
+		return;
+	}
+	post('/change_lang/' + encodeURIComponent(select.value), {}, () => {
 		window.location.reload();
-	}	 )
+	});
 }
 
 function initPrFilesTree() {

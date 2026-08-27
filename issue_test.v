@@ -28,13 +28,14 @@ fn test_repo_issue_count_excludes_pull_request_rows() {
 			app.db.close() or {}
 		}
 		app.create_tables()!
+		assert db_column_exists(mut app.db, 'Issue', 'status')!
 		app.add_repo(Repo{
 			id:        1
 			name:      'repo'
 			user_id:   1
 			user_name: 'alice'
 		})!
-		app.add_imported_issue_returning_id(1, 1, 'issue', 'body', 1)!
+		issue_id := app.add_imported_issue_returning_id(1, 1, 'issue', 'body', 1)!
 		pr_issue := Issue{
 			repo_id:    1
 			author_id:  1
@@ -48,9 +49,24 @@ fn test_repo_issue_count_excludes_pull_request_rows() {
 		}!
 
 		assert app.get_repo_issue_count(1) == 1
+		assert app.get_repo_all_issue_count(1) == 1
+		app.set_issue_status(issue_id, .closed)!
+		closed := app.find_issue_by_id(issue_id) or { panic('issue missing') }
+		assert !closed.is_open()
+		assert app.get_repo_issue_count(1) == 0
+		assert app.get_repo_all_issue_count(1) == 1
+		assert app.get_repo_closed_issue_count(1) == 1
+		assert app.find_repo_issues_as_page(1, 0).len == 0
+		assert app.find_repo_issues_as_page_by_state(1, 0, 'closed').map(it.id) == [
+			issue_id,
+		]
+		assert app.find_repo_issues_as_page_by_state(1, 0, 'all').map(it.id) == [
+			issue_id,
+		]
+		assert normalize_issue_state('invalid') == 'open'
 		app.sync_repo_open_issue_count(1)!
 		repo := app.find_repo_by_id(1) or { panic('repo missing') }
-		assert repo.nr_open_issues == 1
+		assert repo.nr_open_issues == 0
 	} $else {
 		assert true
 	}

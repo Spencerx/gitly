@@ -34,7 +34,7 @@ pub fn (mut app App) handle_ci_status_callback() veb.Result {
 
 	repo_id := callback.repo_id.int()
 	ci_run_id := callback.run_id.int()
-	if repo_id <= 0 || ci_run_id < 0 || !is_valid_commit_hash(callback.commit_hash)
+	if repo_id <= 0 || ci_run_id <= 0 || !is_full_commit_oid(callback.commit_hash)
 		|| !is_safe_ref(callback.branch)
 		|| callback.status !in ['pending', 'running', 'success', 'failure', 'cancelled', 'timed_out'] {
 		ctx.res.set_status(.bad_request)
@@ -46,8 +46,28 @@ pub fn (mut app App) handle_ci_status_callback() veb.Result {
 	}
 	status := ci_status_from_string(callback.status)
 
-	app.upsert_ci_status(repo_id, callback.commit_hash, callback.branch, status, ci_run_id) or {
+	applied := app.apply_ci_status_callback_after_registration(repo_id, callback.commit_hash,
+		callback.branch, ci_run_id, status) or {
+		ctx.res.set_status(.internal_server_error)
 		return ctx.json_error('Failed to update CI status: ${err}')
+	}
+	if !applied {
+		// A very fast run can report status before the trigger HTTP response has
+		// supplied its run id. Ask the runner to retry while that local
+		// reservation exists; applying an unknown id to it would let a stale
+		// callback claim a newer attempt.
+		if app.has_ci_status_reservation(repo_id, callback.commit_hash, callback.branch) {
+			ctx.res.set_status(.conflict)
+			return ctx.json_error('CI run registration is still pending')
+		}
+		// A validly signed callback can still arrive after a newer attempt or for
+		// a run that Gitly never successfully registered. Acknowledge it so the
+		// runner does not retry forever, but never let it create or replace state.
+		app.warn('Ignored CI callback for unknown run ${ci_run_id} in repository ${repo_id}')
+		return ctx.json(api.ApiSuccessResponse[string]{
+			success: true
+			result:  'ignored'
+		})
 	}
 
 	return ctx.json(api.ApiSuccessResponse[string]{
@@ -166,9 +186,7 @@ pub fn (mut app App) ci_restart_run(username string, repo_name string, run_id_st
 	}
 
 	ci_run_id := run_id_str.int()
-	if !app.repo_owns_ci_run(repo.id, ci_run_id) {
-		return ctx.not_found()
-	}
+	source_run := app.find_ci_status_for_run(repo.id, ci_run_id) or { return ctx.not_found() }
 
 	if app.config.ci_service_url == '' {
 		return ctx.not_found()
@@ -186,8 +204,14 @@ pub fn (mut app App) ci_restart_run(username string, repo_name string, run_id_st
 
 	if result.success {
 		new_run := result.result
-		// Update local CI status
-		app.upsert_ci_status(repo.id, new_run.commit_hash, new_run.branch, .pending, new_run.id) or {}
+		if !ci_restart_result_matches(source_run, new_run) {
+			app.warn('Rejected mismatched CI restart response for run ${ci_run_id}')
+			return ctx.server_error('CI restart response could not be verified')
+		}
+		app.upsert_ci_status(repo.id, new_run.commit_hash, new_run.branch, .pending, new_run.id) or {
+			app.warn('Could not bind restarted CI run ${new_run.id}: ${err}')
+			return ctx.server_error('CI restart response could not be registered')
+		}
 		// Redirect to new run
 		return ctx.redirect('/${username}/${repo_name}/ci/${new_run.id}')
 	}
@@ -265,6 +289,13 @@ struct CiRunDetail {
 	finished_at   int
 	error_message string
 	jobs          []CiJobDetail
+}
+
+fn ci_restart_result_matches(source CiStatus, restarted CiRunDetail) bool {
+	return source.id > 0 && source.ci_run_id > 0 && restarted.id > 0
+		&& restarted.id != source.ci_run_id && is_full_commit_oid(source.commit_hash)
+		&& is_full_commit_oid(restarted.commit_hash) && restarted.commit_hash == source.commit_hash
+		&& is_safe_ref(restarted.branch) && restarted.branch == source.branch
 }
 
 struct CiJobDetail {
